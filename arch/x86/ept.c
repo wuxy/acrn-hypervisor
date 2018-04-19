@@ -41,28 +41,12 @@
 
 #define ACRN_DBG_EPT	6
 
-void *create_guest_paging(struct vm *vm)
-{
-	void *hva_dest;
-	void *hva_src;
 
-	/* copy guest identity mapped 4G page table to guest */
-	hva_dest = GPA2HVA(vm,
-			(uint64_t)CPU_Boot_Page_Tables_Start_VM);
-	hva_src = (void *)(_ld_cpu_secondary_reset_load
-			+ (CPU_Boot_Page_Tables_Start_VM
-			- _ld_cpu_secondary_reset_start));
-	/* 2MB page size, need to copy 6 pages */
-	memcpy_s(hva_dest, 6 * CPU_PAGE_SIZE, hva_src, 6 * CPU_PAGE_SIZE);
-	return (void *)CPU_Boot_Page_Tables_Start_VM;
-}
-
-static void *find_next_table(uint32_t table_offset,
-						     void *table_base)
+static uint64_t find_next_table(uint32_t table_offset, void *table_base)
 {
 	uint64_t table_entry;
 	uint64_t table_present;
-	void *sub_table_addr = 0;
+	uint64_t sub_table_addr = 0;
 
 	/* Read the table entry */
 	table_entry = MEM_READ64(table_base
@@ -83,12 +67,11 @@ static void *find_next_table(uint32_t table_offset,
 	}
 
 	/* Get address of the sub-table */
-	sub_table_addr = (void *)(table_entry & IA32E_REF_MASK);
+	sub_table_addr = table_entry & IA32E_REF_MASK;
 
 	/* Return the next table in the walk */
 	return sub_table_addr;
 }
-
 
 void free_ept_mem(void *pml4_addr)
 {
@@ -99,16 +82,22 @@ void free_ept_mem(void *pml4_addr)
 	uint32_t pdpt_index;
 	uint32_t pde_index;
 
+	if (pml4_addr == NULL) {
+		ASSERT(false, "EPTP is NULL");
+		return;
+	}
+
 	for (pml4_index = 0; pml4_index < IA32E_NUM_ENTRIES; pml4_index++) {
 		/* Walk from the PML4 table to the PDPT table */
-		pdpt_addr = find_next_table(pml4_index, pml4_addr);
+		pdpt_addr = HPA2HVA(find_next_table(pml4_index, pml4_addr));
 		if (pdpt_addr == NULL)
 			continue;
 
 		for (pdpt_index = 0; pdpt_index < IA32E_NUM_ENTRIES;
 				pdpt_index++) {
 			/* Walk from the PDPT table to the PD table */
-			pde_addr = find_next_table(pdpt_index, pdpt_addr);
+			pde_addr = HPA2HVA(find_next_table(pdpt_index,
+						pdpt_addr));
 
 			if (pde_addr == NULL)
 				continue;
@@ -116,26 +105,29 @@ void free_ept_mem(void *pml4_addr)
 			for (pde_index = 0; pde_index < IA32E_NUM_ENTRIES;
 					pde_index++) {
 				/* Walk from the PD table to the page table */
-				pte_addr = find_next_table(pde_index,
-						pde_addr);
+				pte_addr = HPA2HVA(find_next_table(pde_index,
+						pde_addr));
 
 				/* Free page table entry table */
 				if (pte_addr)
-					free(pte_addr);
+					free_paging_struct(pte_addr);
 			}
 			/* Free page directory entry table */
 			if (pde_addr)
-				free(pde_addr);
+				free_paging_struct(pde_addr);
 		}
-		free(pdpt_addr);
+		free_paging_struct(pdpt_addr);
 	}
-	free(pml4_addr);
+	free_paging_struct(pml4_addr);
 }
 
 void destroy_ept(struct vm *vm)
 {
-	free_ept_mem(vm->arch_vm.nworld_eptp);
-	free_ept_mem(vm->arch_vm.m2p);
+	free_ept_mem(HPA2HVA(vm->arch_vm.nworld_eptp));
+	free_ept_mem(HPA2HVA(vm->arch_vm.m2p));
+	/* Destroy Secure world ept */
+	if (vm->sworld_control.sworld_enabled)
+		free_ept_mem(HPA2HVA(vm->arch_vm.sworld_eptp));
 }
 
 uint64_t gpa2hpa_check(struct vm *vm, uint64_t gpa,
@@ -147,8 +139,8 @@ uint64_t gpa2hpa_check(struct vm *vm, uint64_t gpa,
 	struct map_params map_params;
 
 	map_params.page_table_type = PTT_EPT;
-	map_params.pml4_base = vm->arch_vm.nworld_eptp;
-	map_params.pml4_inverted = vm->arch_vm.m2p;
+	map_params.pml4_base = HPA2HVA(vm->arch_vm.nworld_eptp);
+	map_params.pml4_inverted = HPA2HVA(vm->arch_vm.m2p);
 	obtain_last_page_table_entry(&map_params, &entry,
 			(void *)gpa, true);
 	if (entry.entry_present == PT_PRESENT
@@ -186,8 +178,8 @@ uint64_t hpa2gpa(struct vm *vm, uint64_t hpa)
 	struct map_params map_params;
 
 	map_params.page_table_type = PTT_EPT;
-	map_params.pml4_base = vm->arch_vm.nworld_eptp;
-	map_params.pml4_inverted = vm->arch_vm.m2p;
+	map_params.pml4_base = HPA2HVA(vm->arch_vm.nworld_eptp);
+	map_params.pml4_inverted = HPA2HVA(vm->arch_vm.m2p);
 
 	obtain_last_page_table_entry(&map_params, &entry,
 			(void *)hpa, false);
@@ -352,8 +344,9 @@ int dm_emulate_mmio_post(struct vcpu *vcpu)
 {
 	int ret = 0;
 	int cur = vcpu->vcpu_id;
-	struct vhm_request_buffer *req_buf =
-		(void *)HPA2HVA(vcpu->vm->sw.req_buf);
+	struct vhm_request_buffer *req_buf;
+
+	req_buf = (struct vhm_request_buffer *)(vcpu->vm->sw.req_buf);
 
 	vcpu->req.reqs.mmio_request.value =
 		req_buf->req_queue[cur].reqs.mmio_request.value;
@@ -407,7 +400,7 @@ static int dm_emulate_mmio_pre(struct vcpu *vcpu, uint64_t exit_qual)
 	return 0;
 }
 
-int ept_violation_handler(struct vcpu *vcpu)
+int ept_violation_vmexit_handler(struct vcpu *vcpu)
 {
 	int status;
 	uint64_t exit_qual;
@@ -506,7 +499,7 @@ out:
 	return status;
 }
 
-int ept_misconfig_handler(__unused struct vcpu *vcpu)
+int ept_misconfig_vmexit_handler(__unused struct vcpu *vcpu)
 {
 	int status;
 
@@ -537,14 +530,13 @@ int ept_mmap(struct vm *vm, uint64_t hpa,
 	/* Setup memory map parameters */
 	map_params.page_table_type = PTT_EPT;
 	if (vm->arch_vm.nworld_eptp) {
-		map_params.pml4_base = vm->arch_vm.nworld_eptp;
-		map_params.pml4_inverted = vm->arch_vm.m2p;
+		map_params.pml4_base = HPA2HVA(vm->arch_vm.nworld_eptp);
+		map_params.pml4_inverted = HPA2HVA(vm->arch_vm.m2p);
 	} else {
-		map_params.pml4_base =
-			alloc_paging_struct();
-		vm->arch_vm.nworld_eptp = map_params.pml4_base;
+		map_params.pml4_base = alloc_paging_struct();
+		vm->arch_vm.nworld_eptp = HVA2HPA(map_params.pml4_base);
 		map_params.pml4_inverted = alloc_paging_struct();
-		vm->arch_vm.m2p = map_params.pml4_inverted;
+		vm->arch_vm.m2p = HVA2HPA(map_params.pml4_inverted);
 	}
 
 	if (type == MAP_MEM || type == MAP_MMIO) {

@@ -157,6 +157,8 @@
 
 #ifndef ASSEMBLER
 
+#include <cpu.h>
+
 /* Define cache line size (in bytes) */
 #define     CACHE_LINE_SIZE                 64
 
@@ -167,7 +169,8 @@
 #define     IA32E_INDEX_MASK_BITS           9
 #define     IA32E_NUM_ENTRIES               512
 #define     IA32E_INDEX_MASK                (uint64_t)(IA32E_NUM_ENTRIES - 1)
-#define     IA32E_REF_MASK                  0x000FFFFFFFFFF000
+#define     IA32E_REF_MASK			\
+	(boot_cpu_data.physical_address_mask)
 #define     IA32E_FIRST_BLOCK_INDEX         1
 
 /* Macro to get PML4 index given an address */
@@ -252,7 +255,7 @@ struct map_params {
 struct entry_params {
 	uint32_t entry_level;
 	uint32_t entry_present;
-	uint64_t entry_base;
+	void *entry_base;
 	uint64_t entry_off;
 	uint64_t entry_val;
 	uint64_t page_size;
@@ -277,6 +280,7 @@ enum _page_table_level {
 enum _page_table_present {
 	PT_NOT_PRESENT = 0,
 	PT_PRESENT = 1,
+	PT_MISCFG_PRESENT = 2,
 };
 
 /* Page size */
@@ -310,18 +314,21 @@ struct mem_io_node {
 	uint64_t range_end;
 };
 
-void *get_paging_pml4(void);
-void *alloc_paging_struct();
-void enable_paging(void *pml4_base_addr);
+uint64_t get_paging_pml4(void);
+bool check_mmu_1gb_support(int page_table_type);
+void *alloc_paging_struct(void);
+void free_paging_struct(void *ptr);
+void enable_paging(uint64_t pml4_base_addr);
 void init_paging(void);
-void map_mem(struct map_params *map_params, void *paddr, void *vaddr,
+int map_mem(struct map_params *map_params, void *paddr, void *vaddr,
 		    uint64_t size, uint32_t flags);
-void unmap_mem(struct map_params *map_params, void *paddr, void *vaddr,
+int unmap_mem(struct map_params *map_params, void *paddr, void *vaddr,
 		      uint64_t size, uint32_t flags);
-void modify_mem(struct map_params *map_params, void *paddr, void *vaddr,
+int modify_mem(struct map_params *map_params, void *paddr, void *vaddr,
 		       uint64_t size, uint32_t flags);
-void mmu_invept(struct vcpu *vcpu);
-void obtain_last_page_table_entry(struct map_params *map_params,
+void invept(struct vcpu *vcpu);
+bool check_continuous_hpa(struct vm *vm, uint64_t gpa, uint64_t size);
+int obtain_last_page_table_entry(struct map_params *map_params,
 		struct entry_params *entry, void *addr, bool direct);
 
 int register_mmio_emulation_handler(struct vm *vm,
@@ -371,12 +378,17 @@ static inline void *mmu_pt_for_pde(uint32_t *pd, uint32_t vaddr)
 	asm volatile ("   wbinvd\n" : : : "memory");	\
 }
 
+static inline void clflush(volatile void *p)
+{
+	asm volatile ("clflush (%0)" :: "r"(p));
+}
+
 /* External variable declarations */
 extern uint8_t CPU_Boot_Page_Tables_Start_VM[];
 
 /* External Interfaces */
 int     is_ept_supported(void);
-void   *create_guest_paging(struct vm *vm);
+uint64_t create_guest_initial_paging(struct vm *vm);
 void    destroy_ept(struct vm *vm);
 uint64_t  gpa2hpa(struct vm *vm, uint64_t gpa);
 uint64_t  gpa2hpa_check(struct vm *vm, uint64_t gpa,
@@ -385,8 +397,8 @@ uint64_t  hpa2gpa(struct vm *vm, uint64_t hpa);
 int ept_mmap(struct vm *vm, uint64_t hpa,
 	uint64_t gpa, uint64_t size, uint32_t type, uint32_t prot);
 
-int     ept_violation_handler(struct vcpu *vcpu);
-int     ept_misconfig_handler(struct vcpu *vcpu);
+int     ept_violation_vmexit_handler(struct vcpu *vcpu);
+int     ept_misconfig_vmexit_handler(struct vcpu *vcpu);
 int     dm_emulate_mmio_post(struct vcpu *vcpu);
 
 #endif /* ASSEMBLER not defined */

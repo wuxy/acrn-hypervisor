@@ -34,21 +34,41 @@
 #ifndef __ACRNBOOT_H__
 #define __ACRNBOOT_H__
 
+#include <bsp_cfg.h>
+#include "multiboot.h"
+
 #define E820_RAM		1
 #define E820_RESERVED		2
 #define E820_ACPI		3
 #define E820_NVS		4
 #define E820_UNUSABLE		5
 
-#define ACRN_HV_SIZE 0x2000000
-#define ACRN_HV_ADDR 0x20000000
+#define ERROR_STRING_LENGTH	32
+#define EFI_LOADER_SIGNATURE    "EL64"
 
-#define ACRN_SECONDARY_SIZE 0xf000
-#define ACRN_SECONDARY_ADDR 0x8000
+#define ACPI_XSDT_ENTRY_SIZE     (sizeof(UINT64))
+#define ACPI_NAME_SIZE                  4
+#define ACPI_OEM_ID_SIZE                6
+#define ACPI_OEM_TABLE_ID_SIZE          8
 
+#define MSR_IA32_PAT                        0x00000277  /* PAT */
+#define MSR_IA32_EFER                       0xC0000080
+#define MSR_IA32_FS_BASE                    0xC0000100
+#define MSR_IA32_GS_BASE                    0xC0000101
+#define MSR_IA32_SYSENTER_ESP               0x00000175  /* ESP for sysenter */
+#define MSR_IA32_SYSENTER_EIP               0x00000176  /* EIP for sysenter */
+
+/* Read MSR */
+#define CPU_MSR_READ(reg, msr_val_ptr)                      \
+{                                                           \
+	uint32_t msrl, msrh;                                 \
+	asm volatile ("rdmsr" : "=a"(msrl),                 \
+		"=d"(msrh) : "c" (reg));            \
+	*msr_val_ptr = ((uint64_t)msrh<<32) | msrl;           \
+}
 
 EFI_STATUS get_pe_section(CHAR8 *base, char *section, UINTN *vaddr, UINTN *size);
-EFI_STATUS load_sos_image(EFI_HANDLE image, CHAR16 *name, CHAR16 *cmdline);
+typedef void(*hv_func)(int, struct multiboot_info*);
 
 struct efi_info {
 	UINT32 efi_loader_signature;
@@ -74,9 +94,8 @@ struct e820_entry {
 
 
 struct efi_ctx {
-	EFI_IMAGE_ENTRY_POINT entry;
-	EFI_HANDLE handle;
-	EFI_SYSTEM_TABLE* table;
+	uint64_t rip;
+	VOID *rsdp;
 	dt_addr_t  gdt;
 	dt_addr_t  idt;
 	uint16_t   tr_sel;
@@ -92,9 +111,75 @@ struct efi_ctx {
 	uint16_t   ds_sel;
 	uint16_t   fs_sel;
 	uint16_t   gs_sel;
-	uint64_t   rsp;
 	uint64_t   efer;
+	uint64_t   rax;
+	uint64_t   rbx;
+	uint64_t   rcx;
+	uint64_t   rdx;
+	uint64_t   rdi;
+	uint64_t   rsi;
+	uint64_t   rsp;
+	uint64_t   rbp;
+	uint64_t   r8;
+	uint64_t   r9;
+	uint64_t   r10;
+	uint64_t   r11;
+	uint64_t   r12;
+	uint64_t   r13;
+	uint64_t   r14;
+	uint64_t   r15;
 }__attribute__((packed));
+
+struct acpi_table_rsdp {
+	/* ACPI signature, contains "RSD PTR " */
+	char signature[8];
+	/* ACPI 1.0 checksum */
+	UINT8 checksum;
+	/* OEM identification */
+	char oem_id[ACPI_OEM_ID_SIZE];
+	/* Must be (0) for ACPI 1.0 or (2) for ACPI 2.0+ */
+	UINT8 revision;
+	/* 32-bit physical address of the RSDT */
+	UINT32 rsdt_physical_address;
+	/* Table length in bytes, including header (ACPI 2.0+) */
+	UINT32 length;
+	/* 64-bit physical address of the XSDT (ACPI 2.0+) */
+	UINT64 xsdt_physical_address;
+	/* Checksum of entire table (ACPI 2.0+) */
+	UINT8 extended_checksum;
+	/* Reserved, must be zero */
+	UINT8 reserved[3];
+};
+
+struct acpi_table_header {
+	 /* ASCII table signature */
+	char signature[ACPI_NAME_SIZE];
+	/* Length of table in bytes, including this header */
+	UINT32 length;
+	/* ACPI Specification minor version number */
+	UINT8 revision;
+	/* To make sum of entire table == 0 */
+	UINT8 checksum;
+	/* ASCII OEM identification */
+	char oem_id[ACPI_OEM_ID_SIZE];
+	/* ASCII OEM table identification */
+	char oem_table_id[ACPI_OEM_TABLE_ID_SIZE];
+	/* OEM revision number */
+	UINT32 oem_revision;
+	/* ASCII ASL compiler vendor ID */
+	char asl_compiler_id[ACPI_NAME_SIZE];
+	/* ASL compiler version */
+	UINT32 asl_compiler_revision;
+};
+
+static inline uint64_t
+msr_read(uint32_t reg_num)
+{
+	uint64_t msr_val;
+
+	CPU_MSR_READ(reg_num, &msr_val);
+	return msr_val;
+}
 
 #endif
 

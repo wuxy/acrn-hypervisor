@@ -34,15 +34,14 @@
 #include <hv_arch.h>
 #include <hv_debug.h>
 
-static int rdtscp_handler(struct vcpu *vcpu);
 static int unhandled_vmexit_handler(struct vcpu *vcpu);
-static int rdtsc_handler(struct vcpu *vcpu);
+static int xsetbv_vmexit_handler(struct vcpu *vcpu);
 /* VM Dispatch table for Exit condition handling */
 static const struct vm_exit_dispatch dispatch_table[] = {
 	[VMX_EXIT_REASON_EXCEPTION_OR_NMI] = {
-		.handler = exception_handler},
+		.handler = exception_vmexit_handler},
 	[VMX_EXIT_REASON_EXTERNAL_INTERRUPT] = {
-		.handler = external_interrupt_handler},
+		.handler = external_interrupt_vmexit_handler},
 	[VMX_EXIT_REASON_TRIPLE_FAULT] = {
 		.handler = unhandled_vmexit_handler},
 	[VMX_EXIT_REASON_INIT_SIGNAL] = {
@@ -54,13 +53,13 @@ static const struct vm_exit_dispatch dispatch_table[] = {
 	[VMX_EXIT_REASON_OTHER_SMI] = {
 		.handler = unhandled_vmexit_handler},
 	[VMX_EXIT_REASON_INTERRUPT_WINDOW] = {
-		.handler = interrupt_win_exiting_handler},
+		.handler = interrupt_window_vmexit_handler},
 	[VMX_EXIT_REASON_NMI_WINDOW] = {
 		.handler = unhandled_vmexit_handler},
 	[VMX_EXIT_REASON_TASK_SWITCH] = {
 		.handler = unhandled_vmexit_handler},
 	[VMX_EXIT_REASON_CPUID] = {
-		.handler = cpuid_handler},
+		.handler = cpuid_vmexit_handler},
 	[VMX_EXIT_REASON_GETSEC] = {
 		.handler = unhandled_vmexit_handler},
 	[VMX_EXIT_REASON_HLT] = {
@@ -72,11 +71,11 @@ static const struct vm_exit_dispatch dispatch_table[] = {
 	[VMX_EXIT_REASON_RDPMC] = {
 		.handler = unhandled_vmexit_handler},
 	[VMX_EXIT_REASON_RDTSC] = {
-		.handler = rdtsc_handler},
+		.handler = unhandled_vmexit_handler},
 	[VMX_EXIT_REASON_RSM] = {
 		.handler = unhandled_vmexit_handler},
 	[VMX_EXIT_REASON_VMCALL] = {
-		.handler = vmcall_handler},
+		.handler = vmcall_vmexit_handler},
 	[VMX_EXIT_REASON_VMCLEAR] {
 		.handler = unhandled_vmexit_handler},
 	[VMX_EXIT_REASON_VMLAUNCH] = {
@@ -96,17 +95,17 @@ static const struct vm_exit_dispatch dispatch_table[] = {
 	[VMX_EXIT_REASON_VMXON] = {
 		.handler = unhandled_vmexit_handler},
 	[VMX_EXIT_REASON_CR_ACCESS] = {
-		.handler = cr_access_handler,
+		.handler = cr_access_vmexit_handler,
 		.need_exit_qualification = 1},
 	[VMX_EXIT_REASON_DR_ACCESS] = {
 		.handler = unhandled_vmexit_handler},
 	[VMX_EXIT_REASON_IO_INSTRUCTION] = {
-		.handler = io_instr_handler,
+		.handler = io_instr_vmexit_handler,
 		.need_exit_qualification = 1},
 	[VMX_EXIT_REASON_RDMSR] = {
-		.handler = rdmsr_handler},
+		.handler = rdmsr_vmexit_handler},
 	[VMX_EXIT_REASON_WRMSR] = {
-		.handler = wrmsr_handler},
+		.handler = wrmsr_vmexit_handler},
 	[VMX_EXIT_REASON_ENTRY_FAILURE_INVALID_GUEST_STATE] = {
 		.handler = unhandled_vmexit_handler,
 		.need_exit_qualification = 1},
@@ -135,15 +134,15 @@ static const struct vm_exit_dispatch dispatch_table[] = {
 	[VMX_EXIT_REASON_LDTR_TR_ACCESS] = {
 		.handler = unhandled_vmexit_handler},
 	[VMX_EXIT_REASON_EPT_VIOLATION] = {
-		.handler = ept_violation_handler,
+		.handler = ept_violation_vmexit_handler,
 		.need_exit_qualification = 1},
 	[VMX_EXIT_REASON_EPT_MISCONFIGURATION] = {
-		.handler = ept_misconfig_handler,
+		.handler = ept_misconfig_vmexit_handler,
 		.need_exit_qualification = 1},
 	[VMX_EXIT_REASON_INVEPT] = {
 		.handler = unhandled_vmexit_handler},
 	[VMX_EXIT_REASON_RDTSCP] = {
-		.handler = rdtscp_handler},
+		.handler = unhandled_vmexit_handler},
 	[VMX_EXIT_REASON_VMX_PREEMPTION_TIMER_EXPIRED] = {
 		.handler = unhandled_vmexit_handler},
 	[VMX_EXIT_REASON_INVVPID] = {
@@ -151,7 +150,7 @@ static const struct vm_exit_dispatch dispatch_table[] = {
 	[VMX_EXIT_REASON_WBINVD] = {
 		.handler = unhandled_vmexit_handler},
 	[VMX_EXIT_REASON_XSETBV] = {
-		.handler = unhandled_vmexit_handler},
+		.handler = xsetbv_vmexit_handler},
 	[VMX_EXIT_REASON_APIC_WRITE] = {
 		.handler = apic_write_vmexit_handler,
 		.need_exit_qualification = 1}
@@ -163,7 +162,7 @@ struct vm_exit_dispatch *vmexit_handler(struct vcpu *vcpu)
 	uint16_t basic_exit_reason;
 
 	/* Obtain interrupt info */
-	vcpu->arch_vcpu.exit_interrupt_info =
+	vcpu->arch_vcpu.idt_vectoring_info =
 	    exec_vmread(VMX_IDT_VEC_INFO_FIELD);
 
 	/* Calculate basic exit reason (low 16-bits) */
@@ -247,13 +246,6 @@ static int write_cr0(struct vcpu *vcpu, uint64_t value)
 		exec_vmwrite(VMX_ENTRY_CONTROLS, value32);
 		pr_dbg("VMX_ENTRY_CONTROLS: 0x%x ", value32);
 
-		/* Disable unrestricted mode */
-		value32 = exec_vmread(VMX_PROC_VM_EXEC_CONTROLS2);
-		value32 |= (VMX_PROCBASED_CTLS2_EPT |
-			    VMX_PROCBASED_CTLS2_RDTSCP);
-		exec_vmwrite(VMX_PROC_VM_EXEC_CONTROLS2, value32);
-		pr_dbg("VMX_PROC_VM_EXEC_CONTROLS2: 0x%x ", value32);
-
 		/* Set up EFER */
 		value64 = exec_vmread64(VMX_GUEST_IA32_EFER_FULL);
 		value64 |= (MSR_IA32_EFER_SCE_BIT |
@@ -311,7 +303,7 @@ static int read_cr3(struct vcpu *vcpu, uint64_t *value)
 	return 0;
 }
 
-int cpuid_handler(struct vcpu *vcpu)
+int cpuid_vmexit_handler(struct vcpu *vcpu)
 {
 	struct run_context *cur_context =
 		&vcpu->arch_vcpu.contexts[vcpu->arch_vcpu.cur_context];
@@ -327,7 +319,7 @@ int cpuid_handler(struct vcpu *vcpu)
 	return 0;
 }
 
-int cr_access_handler(struct vcpu *vcpu)
+int cr_access_vmexit_handler(struct vcpu *vcpu)
 {
 	uint64_t *regptr;
 	struct run_context *cur_context =
@@ -418,80 +410,54 @@ int invlpg_handler(__unused struct vcpu *vcpu)
 
 	return 0;
 }
-
-/*
- * XSETBV instruction set's the XCR0 that is used to tell for which components
- * states can be saved on a context switch using xsave.
- *
- * We don't handle this right now because we are on a platform that does not
- * support XSAVE/XRSTORE feature as reflected by the instruction CPUID.
- *
- * to make sure this never get called until we support it we can prevent the
- * reading of this bit in CPUID VMEXIT.
- *
- * Linux checks this in CPUID: cpufeature.h: #define cpu_has_xsave
- */
-static int xsetbv_instr_handler(__unused struct vcpu *vcpu)
-{
-	ASSERT("Not Supported" == 0, "XSETBV executed");
-
-	return 0;
-}
 #endif
 
-static int rdtsc_handler(struct vcpu *vcpu)
+/*
+ * XSETBV instruction set's the XCR0 that is used to tell for which
+ * components states can be saved on a context switch using xsave.
+ */
+static int xsetbv_vmexit_handler(struct vcpu *vcpu)
 {
-	uint64_t host_tsc, guest_tsc, tsc_offset;
-	uint32_t id;
-	struct run_context *cur_context =
-		&vcpu->arch_vcpu.contexts[vcpu->arch_vcpu.cur_context];
+	int idx;
+	uint64_t val64;
+	struct run_context *ctx_ptr;
 
-	/* Read the host TSC value */
-	CPU_RDTSCP_EXECUTE(&host_tsc, &id);
+	val64 = exec_vmread(VMX_GUEST_CR4);
+	if (!(val64 & CR4_OSXSAVE)) {
+		vcpu_inject_gp(vcpu);
+		return -1;
+	}
 
-	/* Get the guest TSC offset value from VMCS */
-	tsc_offset =
-	    exec_vmread64(VMX_TSC_OFFSET_FULL);
+	idx = vcpu->arch_vcpu.cur_context;
+	if (idx >= NR_WORLD)
+		return -1;
 
-	/* Update the guest TSC value by following: TSC_guest = TSC_host +
-	 * TSC_guest_Offset
-	 */
-	guest_tsc = host_tsc + tsc_offset;
+	ctx_ptr = &(vcpu->arch_vcpu.contexts[idx]);
 
-	/* Return the TSC_guest in rax:rdx */
-	cur_context->guest_cpu_regs.regs.rax = (uint32_t) guest_tsc;
-	cur_context->guest_cpu_regs.regs.rdx = (uint32_t) (guest_tsc >> 32);
+	/*to access XCR0,'rcx' should be 0*/
+	if (ctx_ptr->guest_cpu_regs.regs.rcx != 0) {
+		vcpu_inject_gp(vcpu);
+		return -1;
+	}
 
-	TRACE_2L(TRC_VMEXIT_RDTSC, host_tsc, tsc_offset);
+	val64 = ((ctx_ptr->guest_cpu_regs.regs.rax) & 0xffffffff) |
+			(ctx_ptr->guest_cpu_regs.regs.rdx << 32);
 
-	return 0;
-}
+	/*bit 0(x87 state) of XCR0 can't be cleared*/
+	if (!(val64 & 0x01)) {
+		vcpu_inject_gp(vcpu);
+		return -1;
+	}
 
-static int rdtscp_handler(struct vcpu *vcpu)
-{
-	uint64_t host_tsc, guest_tsc, tsc_offset;
-	uint32_t id;
-	struct run_context *cur_context =
-		&vcpu->arch_vcpu.contexts[vcpu->arch_vcpu.cur_context];
+	/*XCR0[2:1] (SSE state & AVX state) can't not be
+	 *set to 10b as it is necessary to set both bits
+	 *to use AVX instructions.
+	 **/
+	if (((val64 >> 1) & 0x3) == 0x2) {
+		vcpu_inject_gp(vcpu);
+		return -1;
+	}
 
-	/* Read the host TSC value */
-	CPU_RDTSCP_EXECUTE(&host_tsc, &id);
-
-	/* Get the guest TSC offset value from VMCS */
-	tsc_offset =
-	    exec_vmread64(VMX_TSC_OFFSET_FULL);
-
-	/* Update the guest TSC value by following: * TSC_guest = TSC_host +
-	 * TSC_guest_Offset
-	 */
-	guest_tsc = host_tsc + tsc_offset;
-
-	/* Return the TSC_guest in rax:rdx and IA32_TSC_AUX in rcx */
-	cur_context->guest_cpu_regs.regs.rax = (uint32_t) guest_tsc;
-	cur_context->guest_cpu_regs.regs.rdx = (uint32_t) (guest_tsc >> 32);
-	cur_context->guest_cpu_regs.regs.rcx = vcpu->arch_vcpu.msr_tsc_aux;
-
-	TRACE_2L(TRC_VMEXIT_RDTSCP, guest_tsc, vcpu->arch_vcpu.msr_tsc_aux);
-
+	write_xcr(0, val64);
 	return 0;
 }

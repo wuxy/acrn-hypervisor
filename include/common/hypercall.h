@@ -39,6 +39,7 @@
 
 struct vhm_request;
 
+bool is_hypercall_from_ring0(void);
 int acrn_insert_request_wait(struct vcpu *vcpu, struct vhm_request *req);
 int acrn_insert_request_nowait(struct vcpu *vcpu, struct vhm_request *req);
 int get_req_info(char *str, int str_max);
@@ -326,6 +327,37 @@ int64_t hcall_reset_ptdev_intr_info(struct vm *vm, uint64_t vmid,
 int64_t hcall_setup_sbuf(struct vm *vm, uint64_t param);
 
 /**
+ * @brief Switch VCPU state between Normal/Secure World.
+ *
+ * @param vcpu Pointer to VCPU data structure
+ *
+ * @return 0 on success, non-zero on error.
+ */
+
+int64_t hcall_get_cpu_pm_state(struct vm *vm, uint64_t cmd, uint64_t param);
+
+/**
+ * @brief Get VCPU Power state.
+ *
+ * @param VCPU power state data
+ *
+ * @return 0 on success, non-zero on error.
+ */
+
+int64_t hcall_world_switch(struct vcpu *vcpu);
+
+/**
+ * @brief Initialize environment for Trusty-OS on a VCPU.
+ *
+ * @param vcpu Pointer to VCPU data structure
+ * @param param guest physical address. This gpa points to
+ *              struct trusty_boot_param
+ *
+ * @return 0 on success, non-zero on error.
+ */
+int64_t hcall_initialize_trusty(struct vcpu *vcpu, uint64_t param);
+
+/**
  * @}
  */
 
@@ -338,8 +370,8 @@ static inline int check_result(int found)
 	int found = 0;					\
 	typeof(*(ptr)) *h_ptr = (ptr);			\
 	typeof(*(ptr)) *g_ptr =				\
-		(void *)gpa2hpa_check(vm, gpa,		\
-		sizeof(*h_ptr), &found, true);		\
+		HPA2HVA(gpa2hpa_check(vm, gpa,	\
+		sizeof(*h_ptr), &found, true));		\
 	if (found) {					\
 		*h_ptr = *g_ptr;			\
 	}						\
@@ -350,8 +382,8 @@ static inline int check_result(int found)
 	int found = 0;					\
 	typeof(*(ptr)) *h_ptr = (ptr);			\
 	typeof(*(ptr)) *g_ptr =				\
-		(void *)gpa2hpa_check(vm, gpa,		\
-		sizeof(*h_ptr), &found, true);		\
+		HPA2HVA(gpa2hpa_check(vm, gpa,	\
+		sizeof(*h_ptr), &found, true));		\
 	if (found) {					\
 		*g_ptr = *h_ptr;			\
 	}						\

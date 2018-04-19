@@ -171,7 +171,7 @@ void console_dump_bytes(const void *p, unsigned int len)
 	/* dump all bytes */
 	while (x < e) {
 		/* write the address of the first byte in the row */
-		printf("%08x: ", (vaddr_t) x);
+		printf("%08x: ", (uint64_t) x);
 		/* print one row (16 bytes) as hexadecimal values */
 		for (i = 0; i < 16; i++)
 			printf("%02x ", x[i]);
@@ -231,6 +231,6 @@ void console_setup_timer(void)
 {
 	/* Start an one-shot timer */
 	if (add_timer(console_timer_callback, 0,
-		rdtsc() + TIME_MS_DELTA * CONSOLE_KICK_TIMER_TIMEOUT) < 0)
+		rdtsc() + CYCLES_PER_MS * CONSOLE_KICK_TIMER_TIMEOUT) < 0)
 		pr_err("Failed to add console kick timer");
 }

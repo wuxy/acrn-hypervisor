@@ -214,10 +214,10 @@ struct vcpu_arch {
 	uint64_t msr_tsc_aux;
 
 	/* VCPU context state information */
-	uint64_t exit_reason;
-	uint64_t exit_interrupt_info;
+	uint32_t exit_reason;
+	uint32_t idt_vectoring_info;
 	uint64_t exit_qualification;
-	uint8_t inst_len;
+	uint32_t inst_len;
 
 	/* Information related to secondary / AP VCPU start-up */
 	uint8_t cpu_mode;

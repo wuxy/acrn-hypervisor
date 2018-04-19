@@ -83,7 +83,7 @@ static inline uint32_t io_read_long(uint16_t port)
 	return value;
 }
 
-static inline void io_write(uint32_t v, ioport_t addr, size_t sz)
+static inline void io_write(uint32_t v, uint16_t addr, size_t sz)
 {
 	if (sz == 1)
 		io_write_byte(v, addr);
@@ -93,7 +93,7 @@ static inline void io_write(uint32_t v, ioport_t addr, size_t sz)
 		io_write_long(v, addr);
 }
 
-static inline uint32_t io_read(ioport_t addr, size_t sz)
+static inline uint32_t io_read(uint16_t addr, size_t sz)
 {
 	if (sz == 1)
 		return io_read_byte(addr);
@@ -108,17 +108,17 @@ struct vcpu;
 
 typedef
 uint32_t (*io_read_fn_t)(struct vm_io_handler *, struct vm *,
-				ioport_t, size_t);
+				uint16_t, size_t);
 
 typedef
 void (*io_write_fn_t)(struct vm_io_handler *, struct vm *,
-				ioport_t, size_t, uint32_t);
+				uint16_t, size_t, uint32_t);
 
 /* Describes a single IO handler description entry. */
 struct vm_io_handler_desc {
 
 	/** The base address of the IO range for this description. */
-	ioport_t addr;
+	uint16_t addr;
 	/** The number of bytes covered by this description. */
 	size_t len;
 
@@ -167,7 +167,7 @@ struct vm_io_handler {
 #define IO_ATTR_NO_ACCESS       2
 
 /* External Interfaces */
-int io_instr_handler(struct vcpu *vcpu);
+int io_instr_vmexit_handler(struct vcpu *vcpu);
 void   setup_io_bitmap(struct vm *vm);
 void   free_io_emulation_resource(struct vm *vm);
 void   register_io_emulation_handler(struct vm *vm, struct vm_io_range *range,
@@ -180,9 +180,9 @@ int dm_emulate_pio_post(struct vcpu *vcpu);
  *  @param value The 32 bit value to write.
  *  @param addr The memory address to write to.
  */
-static inline void mmio_write_long(uint32_t value, mmio_addr_t addr)
+static inline void mmio_write_long(uint32_t value, void *addr)
 {
-	*((uint32_t *)addr) = value;
+	*((volatile int32_t *)addr) = value;
 }
 
 /** Writes a 16 bit value to a memory mapped IO device.
@@ -190,9 +190,9 @@ static inline void mmio_write_long(uint32_t value, mmio_addr_t addr)
  *  @param value The 16 bit value to write.
  *  @param addr The memory address to write to.
  */
-static inline void mmio_write_word(uint32_t value, mmio_addr_t addr)
+static inline void mmio_write_word(uint32_t value, void *addr)
 {
-	*((uint16_t *)addr) = value;
+	*((volatile uint16_t *)addr) = value;
 }
 
 /** Writes an 8 bit value to a memory mapped IO device.
@@ -200,9 +200,9 @@ static inline void mmio_write_word(uint32_t value, mmio_addr_t addr)
  *  @param value The 8 bit value to write.
  *  @param addr The memory address to write to.
  */
-static inline void mmio_write_byte(uint32_t value, mmio_addr_t addr)
+static inline void mmio_write_byte(uint32_t value, void *addr)
 {
-	*((uint8_t *)addr) = value;
+	*((volatile uint8_t *)addr) = value;
 }
 
 /** Reads a 32 bit value from a memory mapped IO device.
@@ -211,9 +211,9 @@ static inline void mmio_write_byte(uint32_t value, mmio_addr_t addr)
  *
  *  @return The 32 bit value read from the given address.
  */
-static inline uint32_t mmio_read_long(mmio_addr_t addr)
+static inline uint32_t mmio_read_long(void *addr)
 {
-	return *((uint32_t *)addr);
+	return *((volatile uint32_t *)addr);
 }
 
 /** Reads a 16 bit value from a memory mapped IO device.
@@ -222,9 +222,9 @@ static inline uint32_t mmio_read_long(mmio_addr_t addr)
  *
  *  @return The 16 bit value read from the given address.
  */
-static inline uint16_t mmio_read_word(mmio_addr_t addr)
+static inline uint16_t mmio_read_word(void *addr)
 {
-	return *((uint16_t *)addr);
+	return *((volatile uint16_t *)addr);
 }
 
 /** Reads an 8 bit value from a memory mapped IO device.
@@ -233,147 +233,20 @@ static inline uint16_t mmio_read_word(mmio_addr_t addr)
  *
  *  @return The 8 bit  value read from the given address.
  */
-static inline uint8_t mmio_read_byte(mmio_addr_t addr)
+static inline uint8_t mmio_read_byte(void *addr)
 {
-	return *((uint8_t *)addr);
+	return *((volatile uint8_t *)addr);
 }
 
-/** Sets bits in a 32 bit value from a memory mapped IO device.
- *
- *  @param mask Contains the bits to set at the memory address.
- *              Bits set in this mask are set in the memory
- *              location.
- *  @param addr The memory address to read from/write to.
- */
-static inline void mmio_or_long(uint32_t mask, mmio_addr_t addr)
-{
-	*((uint32_t *)addr) |= mask;
-}
-
-/** Sets bits in a 16 bit value from a memory mapped IO device.
- *
- *  @param mask Contains the bits to set at the memory address.
- *              Bits set in this mask are set in the memory
- *              location.
- *  @param addr The memory address to read from/write to.
- */
-static inline void mmio_or_word(uint32_t mask, mmio_addr_t addr)
-{
-	*((uint16_t *)addr) |= mask;
-}
-
-/** Sets bits in an 8 bit value from a memory mapped IO device.
- *
- *  @param mask Contains the bits to set at the memory address.
- *              Bits set in this mask are set in the memory
- *              location.
- *  @param addr The memory address to read from/write to.
- */
-static inline void mmio_or_byte(uint32_t mask, mmio_addr_t addr)
-{
-	*((uint8_t *)addr) |= mask;
-}
-
-/** Clears bits in a 32 bit value from a memory mapped IO device.
- *
- *  @param mask Contains the bits to clear at the memory address.
- *              Bits set in this mask are cleared in the memory
- *              location.
- *  @param addr The memory address to read from/write to.
- */
-static inline void mmio_and_long(uint32_t mask, mmio_addr_t addr)
-{
-	*((uint32_t *)addr) &= ~mask;
-}
-
-/** Clears bits in a 16 bit value from a memory mapped IO device.
- *
- *  @param mask Contains the bits to clear at the memory address.
- *              Bits set in this mask are cleared in the memory
- *              location.
- *  @param addr The memory address to read from/write to.
- */
-static inline void mmio_and_word(uint32_t mask, mmio_addr_t addr)
-{
-	*((uint16_t *)addr) &= ~mask;
-}
-
-/** Clears bits in an 8 bit value from a memory mapped IO device.
- *
- *  @param mask Contains the bits to clear at the memory address.
- *              Bits set in this mask are cleared in the memory
- *              location.
- *  @param addr The memory address to read from/write to.
- */
-static inline void mmio_and_byte(uint32_t mask, mmio_addr_t addr)
-{
-	*((uint8_t *)addr) &= ~mask;
-}
-
-/** Performs a read-modify-write cycle for a 32 bit value from a MMIO device.
- *
- *  Reads a 32 bit value from a memory mapped IO device, sets and clears
- *  bits and writes the value back. If a bit is specified in both, the 'set'
- *  and in the 'clear' mask, it is undefined whether the resulting bit is set
- *  or cleared.
- *
- *  @param set  Contains the bits to set. Bits set in this mask
- *              are set at the memory address.
- *  @param clear Contains the bits to clear. Bits set in this
- *               mask are cleared at the memory address.
- *  @param addr The memory address to read from/write to.
- */
-static inline void mmio_rmw_long(uint32_t set, uint32_t clear, mmio_addr_t addr)
-{
-	*((uint32_t *)addr) =
-	    (*((uint32_t *)addr) & ~clear) | set;
-}
-
-/** Performs a read-modify-write cycle for a 16 bit value from a MMIO device.
- *
- *  Reads a 16 bit value from a memory mapped IO device, sets and clears
- *  bits and writes the value back. If a bit is specified in both, the 'set'
- *  and in the 'clear' mask, it is undefined whether the resulting bit is set
- *  or cleared.
- *
- *  @param set  Contains the bits to set. Bits set in this mask
- *              are set at the memory address.
- *  @param clear Contains the bits to clear. Bits set in this
- *               mask are cleared at the memory address.
- *  @param addr The memory address to read from/write to.
- */
-static inline void mmio_rmw_word(uint32_t set, uint32_t clear, mmio_addr_t addr)
-{
-	*((uint16_t *)addr) =
-	    (*((uint16_t *)addr) & ~clear) | set;
-}
-
-/** Performs a read-modify-write cycle for an 8 bit value from a MMIO device.
- *
- *  Reads an 8 bit value from a memory mapped IO device, sets and clears
- *  bits and writes the value back. If a bit is specified in both, the 'set'
- *  and in the 'clear' mask, it is undefined whether the resulting bit is set
- *  or cleared.
- *
- *  @param set  Contains the bits to set. Bits set in this mask
- *              are set at the memory address.
- *  @param clear Contains the bits to clear. Bits set in this
- *               mask are cleared at the memory address.
- *  @param addr The memory address to read from/write to.
- */
-static inline void mmio_rmw_byte(uint32_t set, uint32_t clear, mmio_addr_t addr)
-{
-	*((uint8_t *)addr) = (*((uint8_t *)addr) & ~clear) | set;
-}
 
 /** Writes a 32 bit value to a memory mapped IO device (ROM code version).
  *
  *  @param value The 32 bit value to write.
  *  @param addr The memory address to write to.
  */
-static inline void __mmio_write_long(uint32_t value, mmio_addr_t addr)
+static inline void __mmio_write_long(uint32_t value, void *addr)
 {
-	*((uint32_t *)addr) = value;
+	*((volatile uint32_t *)addr) = value;
 }
 
 /** Writes a 16 bit value to a memory mapped IO device (ROM code version).
@@ -381,9 +254,9 @@ static inline void __mmio_write_long(uint32_t value, mmio_addr_t addr)
  *  @param value The 16 bit value to write.
  *  @param addr The memory address to write to.
  */
-static inline void __mmio_write_word(uint32_t value, mmio_addr_t addr)
+static inline void __mmio_write_word(uint32_t value, void *addr)
 {
-	*((uint16_t *)addr) = value;
+	*((volatile uint16_t *)addr) = value;
 }
 
 /** Writes an 8 bit value to a memory mapped IO device (ROM code version).
@@ -391,9 +264,9 @@ static inline void __mmio_write_word(uint32_t value, mmio_addr_t addr)
  *  @param value The 8 bit value to write.
  *  @param addr The memory address to write to.
  */
-static inline void __mmio_write_byte(uint32_t value, mmio_addr_t addr)
+static inline void __mmio_write_byte(uint32_t value, void *addr)
 {
-	*((uint8_t *)addr) = value;
+	*((volatile uint8_t *)addr) = value;
 }
 
 /** Reads a 32 bit value from a memory mapped IO device (ROM code version).
@@ -402,9 +275,9 @@ static inline void __mmio_write_byte(uint32_t value, mmio_addr_t addr)
  *
  *  @return The 32 bit value read from the given address.
  */
-static inline uint32_t __mmio_read_long(mmio_addr_t addr)
+static inline uint32_t __mmio_read_long(void *addr)
 {
-	return *((uint32_t *)addr);
+	return *((volatile uint32_t *)addr);
 }
 
 /** Reads a 16 bit value from a memory mapped IO device (ROM code version).
@@ -413,9 +286,9 @@ static inline uint32_t __mmio_read_long(mmio_addr_t addr)
  *
  *  @return The 16 bit value read from the given address.
  */
-static inline uint16_t __mmio_read_word(mmio_addr_t addr)
+static inline uint16_t __mmio_read_word(void *addr)
 {
-	return *((uint16_t *)addr);
+	return *((volatile uint16_t *)addr);
 }
 
 /** Reads an 8 bit value from a memory mapped IO device (ROM code version).
@@ -424,144 +297,11 @@ static inline uint16_t __mmio_read_word(mmio_addr_t addr)
  *
  *  @return The 32 16 value read from the given address.
  */
-static inline uint8_t __mmio_read_byte(mmio_addr_t addr)
+static inline uint8_t __mmio_read_byte(void *addr)
 {
-	return *((uint8_t *)addr);
+	return *((volatile uint8_t *)addr);
 }
 
-/** Sets bits in a 32 bit value from a MMIO device (ROM code version).
- *
- *  @param mask Contains the bits to set at the memory address.
- *              Bits set in this mask are set in the memory
- *              location.
- *  @param addr The memory address to read from/write to.
- */
-static inline void __mmio_or_long(uint32_t mask, mmio_addr_t addr)
-{
-	*((uint32_t *)addr) |= mask;
-}
-
-/** Sets bits in a 16 bit value from a MMIO device (ROM code version).
- *
- *  @param mask Contains the bits to set at the memory address.
- *              Bits set in this mask are set in the memory
- *              location.
- *  @param addr The memory address to read from/write to.
- */
-static inline void __mmio_or_word(uint32_t mask, mmio_addr_t addr)
-{
-	*((uint16_t *)addr) |= mask;
-}
-
-/** Sets bits in an 8 bit value from a MMIO device (ROM code version).
- *
- *  @param mask Contains the bits to set at the memory address.
- *              Bits set in this mask are set in the memory
- *              location.
- *  @param addr The memory address to read from/write to.
- */
-static inline void __mmio_or_byte(uint32_t mask, mmio_addr_t addr)
-{
-	*((uint8_t *)addr) |= mask;
-}
-
-/** Clears bits in a 32 bit value from a MMIO device (ROM code version).
- *
- *  @param mask Contains the bits to clear at the memory address.
- *              Bits set in this mask are cleared in the memory
- *              location.
- *  @param addr The memory address to read from/write to.
- */
-static inline void __mmio_and_long(uint32_t mask, mmio_addr_t addr)
-{
-	*((uint32_t *)addr) &= ~mask;
-}
-
-/** Clears bits in a 16 bit value from a MMIO device (ROM code version).
- *
- *  @param mask Contains the bits to clear at the memory address.
- *              Bits set in this mask are cleared in the memory
- *              location.
- *  @param addr The memory address to read from/write to.
- */
-static inline void __mmio_and_word(uint32_t mask, mmio_addr_t addr)
-{
-	*((uint16_t *)addr) &= ~mask;
-}
-
-/** Clears bits in an 8 bit value from a MMIO device (ROM code version).
- *
- *  @param mask Contains the bits to clear at the memory address.
- *              Bits set in this mask are cleared in the memory
- *              location.
- *  @param addr The memory address to read from/write to.
- */
-static inline void __mmio_and_byte(uint32_t mask, mmio_addr_t addr)
-{
-	*((uint8_t *)addr) &= ~mask;
-}
-
-/** Performs a read-modify-write cycle for a 32 bit value from a MMIO device
- * (ROM code version).
- *
- *  Reads a 32 bit value from a memory mapped IO device, sets and clears
- *  bits and writes the value back. If a bit is specified in both, the 'set'
- *  and in the 'clear' mask, it is undefined whether the resulting bit is set
- *  or cleared.
- *
- *  @param set  Contains the bits to set. Bits set in this mask
- *              are set at the memory address.
- *  @param clear Contains the bits to clear. Bits set in this
- *               mask are cleared at the memory address.
- *  @param addr The memory address to read from/write to.
- */
-static inline void
-__mmio_rmw_long(uint32_t set, uint32_t clear, mmio_addr_t addr)
-{
-	*((uint32_t *)addr) =
-	    (*((uint32_t *)addr) & ~clear) | set;
-}
-
-/** Performs a read-modify-write cycle for a 16 bit value from a MMIO device
- * (ROM code version).
- *
- *  Reads a 16 bit value from a memory mapped IO device, sets and clears
- *  bits and writes the value back. If a bit is specified in both, the 'set'
- *  and in the 'clear' mask, it is undefined whether the resulting bit is set
- *  or cleared.
- *
- *  @param set  Contains the bits to set. Bits set in this mask
- *              are set at the memory address.
- *  @param clear Contains the bits to clear. Bits set in this
- *               mask are cleared at the memory address.
- *  @param addr The memory address to read from/write to.
- */
-static inline void
-__mmio_rmw_word(uint32_t set, uint32_t clear, mmio_addr_t addr)
-{
-	*((uint16_t *)addr) =
-	    (*((uint16_t *)addr) & ~clear) | set;
-}
-
-/** Performs a read-modify-write cycle for an 8 bit value from a MMIO device
- * (ROM code version).
- *
- *  Reads an 8 bit value from a memory mapped IO device, sets and clears
- *  bits and writes the value back. If a bit is specified in both, the 'set'
- *  and in the 'clear' mask, it is undefined whether the resulting bit is set
- *  or cleared.
- *
- *  @param set  Contains the bits to set. Bits set in this mask
- *              are set at the memory address.
- *  @param clear Contains the bits to clear. Bits set in this
- *               mask are cleared at the memory address.
- *  @param addr The memory address to read from/write to.
- */
-static inline void
-__mmio_rmw_byte(uint32_t set, uint32_t clear, mmio_addr_t addr)
-{
-	*((uint8_t *)addr) = (*((uint8_t *)addr) & ~clear) | set;
-}
 
 /** Reads a 32 Bit memory mapped IO register, mask it and write it back into
  *  memory mapped IO register.
@@ -570,7 +310,7 @@ __mmio_rmw_byte(uint32_t set, uint32_t clear, mmio_addr_t addr)
  * @param mask    The mask to apply to the value read.
  * @param value   The 32 bit value to write.
  */
-static inline void setl(mmio_addr_t addr, uint32_t mask, uint32_t value)
+static inline void setl(void *addr, uint32_t mask, uint32_t value)
 {
 	mmio_write_long((mmio_read_long(addr) & ~mask) | value, addr);
 }
@@ -582,7 +322,7 @@ static inline void setl(mmio_addr_t addr, uint32_t mask, uint32_t value)
  * @param mask    The mask to apply to the value read.
  * @param value   The 16 bit value to write.
  */
-static inline void setw(mmio_addr_t addr, uint32_t mask, uint32_t value)
+static inline void setw(void *addr, uint32_t mask, uint32_t value)
 {
 	mmio_write_word((mmio_read_word(addr) & ~mask) | value, addr);
 }
@@ -594,7 +334,7 @@ static inline void setw(mmio_addr_t addr, uint32_t mask, uint32_t value)
  * @param mask    The mask to apply to the value read.
  * @param value   The 8 bit value to write.
  */
-static inline void setb(mmio_addr_t addr, uint32_t mask, uint32_t value)
+static inline void setb(void *addr, uint32_t mask, uint32_t value)
 {
 	mmio_write_byte((mmio_read_byte(addr) & ~mask) | value, addr);
 }

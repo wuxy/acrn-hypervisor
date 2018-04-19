@@ -39,13 +39,12 @@ int dm_emulate_pio_post(struct vcpu *vcpu)
 {
 	int cur = vcpu->vcpu_id;
 	int cur_context = vcpu->arch_vcpu.cur_context;
-	struct vhm_request_buffer *req_buf =
-		(void *)HPA2HVA(vcpu->vm->sw.req_buf);
+	struct vhm_request_buffer *req_buf = NULL;
 	uint32_t mask =
 		0xFFFFFFFFul >> (32 - 8 * vcpu->req.reqs.pio_request.size);
 	uint64_t *rax;
 
-	ASSERT(cur_context == 0, "pio emulation only happen in normal wrold");
+	req_buf = (struct vhm_request_buffer *)(vcpu->vm->sw.req_buf);
 
 	rax = &vcpu->arch_vcpu.contexts[cur_context].guest_cpu_regs.regs.rax;
 	vcpu->req.reqs.pio_request.value =
@@ -79,7 +78,7 @@ static void dm_emulate_pio_pre(struct vcpu *vcpu, uint64_t exit_qual,
 	vcpu->req.reqs.pio_request.value = req_value;
 }
 
-int io_instr_handler(struct vcpu *vcpu)
+int io_instr_vmexit_handler(struct vcpu *vcpu)
 {
 	uint32_t sz;
 	uint32_t mask;
@@ -91,9 +90,6 @@ int io_instr_handler(struct vcpu *vcpu)
 	int cur_context_idx = vcpu->arch_vcpu.cur_context;
 	struct run_context *cur_context;
 	int status = -EINVAL;
-
-	ASSERT(cur_context_idx == 0,
-		"pio emulation only happen in normal wrold");
 
 	cur_context = &vcpu->arch_vcpu.contexts[cur_context_idx];
 	exit_qual = vcpu->arch_vcpu.exit_qualification;
@@ -212,14 +208,14 @@ static void deny_guest_io_access(struct vm *vm, uint32_t address, uint32_t nbyte
 
 static uint32_t
 default_io_read(__unused struct vm_io_handler *hdlr, __unused struct vm *vm,
-			ioport_t address, size_t width)
+			uint16_t address, size_t width)
 {
 	uint32_t v = io_read(address, width);
 	return v;
 }
 
 static void default_io_write(__unused struct vm_io_handler *hdlr,
-			__unused struct vm *vm, ioport_t addr,
+			__unused struct vm *vm, uint16_t addr,
 			size_t width, uint32_t v)
 {
 	io_write(v, addr, width);

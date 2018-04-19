@@ -76,8 +76,13 @@ struct vm_sw_info {
 	struct sw_kernel_info kernel_info;
 	/* Additional information specific to Linux guests */
 	struct sw_linux linux_info;
-	/* GPA Address of guest OS's request buffer */
-	uint64_t req_buf;
+	/* HVA to guest OS's request buffer */
+	void *req_buf;
+};
+
+struct vm_pm_info {
+	uint8_t			px_cnt;
+	struct cpu_px_data	px_data[MAX_PSTATE];
 };
 
 /* VM guest types */
@@ -108,15 +113,15 @@ struct vm_state_info {
 };
 
 struct vm_arch {
-	void *guest_pml4;	/* Guest pml4 */
+	uint64_t guest_init_pml4;/* Guest init pml4 */
 	/* EPT hierarchy for Normal World */
-	void *nworld_eptp;
+	uint64_t nworld_eptp;
 	/* EPT hierarchy for Secure World
 	 * Secure world can access Normal World's memory,
 	 * but Normal World can not access Secure World's memory.
 	 */
-	void *sworld_eptp;
-	void *m2p;		/* machine address to guest physical address */
+	uint64_t sworld_eptp;
+	uint64_t m2p;		/* machine address to guest physical address */
 	void *tmp_pg_array;	/* Page array for tmp guest paging struct */
 	void *iobitmap[2];/* IO bitmap page array base address for this VM */
 	void *msr_bitmap;	/* MSR bitmap page base address for this VM */
@@ -152,6 +157,7 @@ struct vm {
 	struct vm_attr attr;	/* Reference to this VM's attributes */
 	struct vm_hw_info hw;	/* Reference to this VM's HW information */
 	struct vm_sw_info sw;	/* Reference to SW associated with this VM */
+	struct vm_pm_info pm;	/* Reference to this VM's arch information */
 	struct vm_arch arch_vm;	/* Reference to this VM's arch information */
 	struct vm_state_info state_info;/* State info of this VM */
 	enum vm_state state;	/* VM state */
@@ -173,10 +179,6 @@ struct vm {
 		struct _vm_virtual_device_node *head;
 		struct _vm_virtual_device_node *tail;
 	} virtual_device_list;
-
-	/* passthrough device link */
-	struct list_head ptdev_list;
-	spinlock_t ptdev_lock;
 
 	unsigned char GUID[16];
 	struct secure_world_control sworld_control;

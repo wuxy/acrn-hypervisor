@@ -62,6 +62,7 @@ struct vhm_request;
 struct e820_mem_params {
 	uint64_t mem_bottom;
 	uint64_t mem_top;
+	uint64_t total_mem_size;
 	uint64_t max_ram_blk_base; /* used for the start address of UOS */
 	uint64_t max_ram_blk_size;
 };
@@ -97,8 +98,8 @@ extern struct e820_entry e820[E820_MAX_ENTRIES];
 extern uint32_t boot_regs[];
 extern struct e820_mem_params e820_mem;
 
-int rdmsr_handler(struct vcpu *vcpu);
-int wrmsr_handler(struct vcpu *vcpu);
+int rdmsr_vmexit_handler(struct vcpu *vcpu);
+int wrmsr_vmexit_handler(struct vcpu *vcpu);
 void init_msr_emulation(struct vcpu *vcpu);
 
 extern const char vm_exit[];

@@ -53,12 +53,15 @@
 #define UEFI_PCI_IRQ_ASSIGNMENT_NUM 28
 
 #ifdef CONFIG_EFI_STUB
+static void efi_init(void);
+
 uint32_t efi_physical_available_ap_bitmap = 0;
 uint32_t efi_wake_up_ap_bitmap = 0;
 struct efi_ctx* efi_ctx = NULL;
 struct lapic_regs uefi_lapic_regs;
 extern uint32_t up_count;
 extern unsigned long pcpu_sync;
+static int efi_initialized;
 
 void efi_spurious_handler(int vector)
 {
@@ -87,7 +90,7 @@ int sipi_from_efi_boot_service_exit(uint32_t dest, uint32_t mode, uint32_t vec)
 		if (mode == APIC_DELMODE_STARTUP) {
 			uint32_t cpu_id = cpu_find_logical_id(dest);
 			send_startup_ipi(INTR_CPU_STARTUP_USE_DEST,
-		       cpu_id, (paddr_t)(vec<<12));
+		       cpu_id, (uint64_t)(vec<<12));
 			efi_wake_up_ap_bitmap |= 1 << dest;
 		}
 
@@ -105,7 +108,7 @@ void efi_deferred_wakeup_pcpu(int cpu_id)
 	expected_up = up_count + 1;
 
 	send_startup_ipi(INTR_CPU_STARTUP_USE_DEST,
-		cpu_id, (paddr_t)cpu_secondary_reset);
+		cpu_id, (uint64_t)cpu_secondary_reset);
 
 	timeout = CPU_UP_TIMEOUT * 1000;
 
@@ -135,14 +138,59 @@ int uefi_sw_loader(struct vm *vm, struct vcpu *vcpu)
 
 	vlapic_restore(vcpu->arch_vcpu.vlapic, &uefi_lapic_regs);
 
-	vcpu->entry_addr = efi_ctx->entry;
-	cur_context->guest_cpu_regs.regs.rcx = efi_ctx->handle;
-	cur_context->guest_cpu_regs.regs.rdx = efi_ctx->table;
+	vcpu->entry_addr = (void *)efi_ctx->rip;
+	cur_context->guest_cpu_regs.regs.rax = efi_ctx->rax;
+	cur_context->guest_cpu_regs.regs.rbx = efi_ctx->rbx;
+	cur_context->guest_cpu_regs.regs.rdx = efi_ctx->rcx;
+	cur_context->guest_cpu_regs.regs.rcx = efi_ctx->rdx;
+	cur_context->guest_cpu_regs.regs.rdi = efi_ctx->rdi;
+	cur_context->guest_cpu_regs.regs.rsi = efi_ctx->rsi;
+	cur_context->guest_cpu_regs.regs.rbp = efi_ctx->rbp;
+	cur_context->guest_cpu_regs.regs.r8 = efi_ctx->r8;
+	cur_context->guest_cpu_regs.regs.r9 = efi_ctx->r9;
+	cur_context->guest_cpu_regs.regs.r10 = efi_ctx->r10;
+	cur_context->guest_cpu_regs.regs.r11 = efi_ctx->r11;
+	cur_context->guest_cpu_regs.regs.r12 = efi_ctx->r12;
+	cur_context->guest_cpu_regs.regs.r13 = efi_ctx->r13;
+	cur_context->guest_cpu_regs.regs.r14 = efi_ctx->r14;
+	cur_context->guest_cpu_regs.regs.r15 = efi_ctx->r15;
 
 	/* defer irq enabling till vlapic is ready */
 	CPU_IRQ_ENABLE();
 
 	return ret;
+}
+
+void *get_rsdp_from_uefi(void)
+{
+	if (!efi_initialized)
+		efi_init();
+
+	return HPA2HVA(efi_ctx->rsdp);
+}
+
+static void efi_init(void)
+{
+	struct multiboot_info *mbi = NULL;
+
+	if (boot_regs[0] != MULTIBOOT_INFO_MAGIC)
+		ASSERT(0, "no multiboot info found");
+
+	mbi = (struct multiboot_info *)HPA2HVA(((uint64_t)(uint32_t)boot_regs[1]));
+
+	if (!(mbi->mi_flags & MULTIBOOT_INFO_HAS_DRIVES))
+		ASSERT(0, "no multiboot drivers for uefi found");
+
+	efi_ctx = (struct efi_ctx *)HPA2HVA((uint64_t)mbi->mi_drives_addr);
+	ASSERT(efi_ctx != NULL, "no uefi context found");
+
+	vm_sw_loader = uefi_sw_loader;
+
+	spurious_handler = efi_spurious_handler;
+
+	save_lapic(&uefi_lapic_regs);
+
+	efi_initialized = 1;
 }
 #endif
 
@@ -151,13 +199,7 @@ void init_bsp(void)
 	parse_hv_cmdline();
 
 #ifdef CONFIG_EFI_STUB
-	efi_ctx = (struct efi_ctx*)(uint64_t)boot_regs[2];
-	ASSERT(efi_ctx != NULL, "");
-
-	vm_sw_loader = uefi_sw_loader;
-
-	spurious_handler = efi_spurious_handler;
-
-	save_lapic(&uefi_lapic_regs);
+	if (!efi_initialized)
+		efi_init();
 #endif
 }

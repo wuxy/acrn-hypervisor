@@ -43,6 +43,9 @@
 #define CPU_PAGE_SIZE           0x1000
 #define CPU_PAGE_MASK           0xFFFFFFFFFFFFF000
 
+#define MMU_PTE_PAGE_SHIFT	CPU_PAGE_SHIFT
+#define MMU_PDE_PAGE_SHIFT	21
+
 /* Define CPU stack alignment */
 #define CPU_STACK_ALIGN         16
 
@@ -147,6 +150,8 @@
 
 #ifndef ASSEMBLER
 
+int cpu_find_logical_id(uint32_t lapic_id);
+
 /**********************************/
 /* EXTERNAL VARIABLES             */
 /**********************************/
@@ -193,6 +198,7 @@ EXTERN_CPU_DATA(uint8_t[STACK_SIZE], stack) __aligned(16);
 
 extern void *per_cpu_data_base_ptr;
 extern int phy_cpu_num;
+extern uint64_t pcpu_active_bitmap;
 
 #define	PER_CPU_DATA_OFFSET(sym_addr)					\
 	((uint64_t)(sym_addr) - (uint64_t)(_ld_cpu_data_start))
@@ -218,25 +224,33 @@ extern int phy_cpu_num;
 
 /* CPUID feature words */
 enum feature_word {
-	FEAT_1_ECX,         /* CPUID[1].ECX */
-	FEAT_1_EDX,         /* CPUID[1].EDX */
-	FEAT_7_0_EBX,       /* CPUID[EAX=7,ECX=0].EBX */
-	FEAT_7_0_ECX,       /* CPUID[EAX=7,ECX=0].ECX */
-	FEAT_7_0_EDX,       /* CPUID[EAX=7,ECX=0].EDX */
-	FEAT_8000_0001_ECX, /* CPUID[8000_0001].ECX */
-	FEAT_8000_0001_EDX, /* CPUID[8000_0001].EDX */
+	FEAT_1_ECX = 0,         /* CPUID[1].ECX */
+	FEAT_1_EDX = 1,         /* CPUID[1].EDX */
+	FEAT_7_0_EBX = 2,       /* CPUID[EAX=7,ECX=0].EBX */
+	FEAT_7_0_ECX = 3,       /* CPUID[EAX=7,ECX=0].ECX */
+	FEAT_7_0_EDX = 4,       /* CPUID[EAX=7,ECX=0].EDX */
+	FEAT_8000_0000_EAX = 5, /* CPUID[8000_0000].EAX */
+	FEAT_8000_0001_ECX = 6, /* CPUID[8000_0001].ECX */
+	FEAT_8000_0001_EDX = 7, /* CPUID[8000_0001].EDX */
+	FEAT_8000_0008_EAX = 8, /* CPUID[8000_0008].EAX */
 	FEATURE_WORDS,
 };
 
 struct cpuinfo_x86 {
 	uint8_t x86, x86_model;
+	uint64_t physical_address_mask;
 	uint32_t cpuid_leaves[FEATURE_WORDS];
+	char model_name[64];
+	uint8_t			px_cnt;
+	struct cpu_px_data	*px_data;
 };
 
 extern struct cpuinfo_x86 boot_cpu_data;
 
+#define MAX_PSTATE	20
+
 /* Function prototypes */
-void cpu_halt(uint32_t logical_id);
+void cpu_dead(uint32_t logical_id);
 uint64_t cpu_cycles_per_second(void);
 uint64_t tsc_cycles_in_period(uint16_t timer_period_in_us);
 void cpu_secondary_reset(void);
@@ -244,7 +258,7 @@ int hv_main(int cpu_id);
 bool is_vapic_supported(void);
 bool is_vapic_intr_delivery_supported(void);
 bool is_vapic_virt_reg_supported(void);
-bool get_vmx_cap(void);
+bool cpu_has_cap(uint32_t bit);
 
 /* Read control register */
 #define CPU_CR_READ(cr, result_ptr)                         \
@@ -425,6 +439,15 @@ msr_write(uint32_t reg_num, uint64_t value64)
 	CPU_MSR_WRITE(reg_num, value64);
 }
 
+static inline void
+write_xcr(int reg, uint64_t val)
+{
+	uint32_t low, high;
+
+	low = val;
+	high = val >> 32;
+	asm volatile("xsetbv" : : "c" (reg), "a" (low), "d" (high));
+}
 #else /* ASSEMBLER defined */
 
 #endif /* ASSEMBLER defined */

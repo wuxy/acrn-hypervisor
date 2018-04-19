@@ -35,7 +35,7 @@
 #include <acrn_hv_defs.h>
 #include <hypercall.h>
 
-int vmcall_handler(struct vcpu *vcpu)
+int vmcall_vmexit_handler(struct vcpu *vcpu)
 {
 	int64_t ret = 0;
 	struct vm *vm = vcpu->vm;
@@ -132,6 +132,18 @@ int vmcall_handler(struct vcpu *vcpu)
 
 	case HC_SETUP_SBUF:
 		ret = hcall_setup_sbuf(vm, param1);
+		break;
+
+	case HC_WORLD_SWITCH:
+		ret = hcall_world_switch(vcpu);
+		break;
+
+	case HC_INITIALIZE_TRUSTY:
+		ret = hcall_initialize_trusty(vcpu, param1);
+		break;
+
+	case HC_PM_GET_CPU_STATE:
+		ret = hcall_get_cpu_pm_state(vm, param1, param2);
 		break;
 
 	default:

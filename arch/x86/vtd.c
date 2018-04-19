@@ -105,7 +105,7 @@
 #define IOMMU_LOCK(u) spinlock_obtain(&((u)->lock))
 #define IOMMU_UNLOCK(u) spinlock_release(&((u)->lock))
 
-#define DMAR_OP_TIMEOUT TIME_MS_DELTA
+#define DMAR_OP_TIMEOUT CYCLES_PER_MS
 
 #define DMAR_WAIT_COMPLETION(offset, condition, status) \
 	do {                                                \
@@ -114,7 +114,7 @@
 			status = iommu_read32(dmar_uint, offset);   \
 			if (condition)                              \
 				break;                                  \
-			ASSERT((rdtsc() - start < TIME_MS_DELTA),        \
+			ASSERT((rdtsc() - start < CYCLES_PER_MS),        \
 				"DMAR OP Timeout!");   \
 			asm volatile ("pause" ::: "memory");        \
 		}                                               \
@@ -176,7 +176,7 @@ struct iommu_domain {
 	uint16_t dom_id;
 	int vm_id;
 	uint32_t addr_width;   /* address width of the domain */
-	void *trans_table_ptr;
+	uint64_t trans_table_ptr;
 };
 
 static struct list_head dmar_drhd_units;
@@ -208,9 +208,8 @@ static int register_hrhd_units(void)
 	}
 
 	for (i = 0; i < info->drhd_count; i++) {
-		drhd_rt = malloc(sizeof(struct dmar_drhd_rt));
+		drhd_rt = calloc(1, sizeof(struct dmar_drhd_rt));
 		ASSERT(drhd_rt != NULL, "");
-		memset(drhd_rt, 0, sizeof(struct dmar_drhd_rt));
 		drhd_rt->drhd = &info->drhd_units[i];
 		dmar_register_hrhd(drhd_rt);
 	}
@@ -220,16 +219,16 @@ static int register_hrhd_units(void)
 
 static uint32_t iommu_read32(struct dmar_drhd_rt *dmar_uint, uint32_t offset)
 {
-	return mmio_read_long(dmar_uint->drhd->reg_base_addr + offset);
+	return mmio_read_long(HPA2HVA(dmar_uint->drhd->reg_base_addr + offset));
 }
 
 static uint64_t iommu_read64(struct dmar_drhd_rt *dmar_uint, uint32_t offset)
 {
 	uint64_t value;
 
-	value = (mmio_read_long(dmar_uint->drhd->reg_base_addr + offset + 4));
+	value = mmio_read_long(HPA2HVA(dmar_uint->drhd->reg_base_addr + offset + 4));
 	value = value << 32;
-	value = value | (mmio_read_long(dmar_uint->drhd->reg_base_addr +
+	value = value | mmio_read_long(HPA2HVA(dmar_uint->drhd->reg_base_addr +
 					offset));
 
 	return value;
@@ -238,7 +237,7 @@ static uint64_t iommu_read64(struct dmar_drhd_rt *dmar_uint, uint32_t offset)
 static void iommu_write32(struct dmar_drhd_rt *dmar_uint, uint32_t offset,
 			  uint32_t value)
 {
-	mmio_write_long(value, dmar_uint->drhd->reg_base_addr + offset);
+	mmio_write_long(value, HPA2HVA(dmar_uint->drhd->reg_base_addr + offset));
 }
 
 static void iommu_write64(struct dmar_drhd_rt *dmar_uint, uint32_t offset,
@@ -247,10 +246,24 @@ static void iommu_write64(struct dmar_drhd_rt *dmar_uint, uint32_t offset,
 	uint32_t temp;
 
 	temp = value;
-	mmio_write_long(temp, dmar_uint->drhd->reg_base_addr + offset);
+	mmio_write_long(temp, HPA2HVA(dmar_uint->drhd->reg_base_addr + offset));
 
 	temp = value >> 32;
-	mmio_write_long(temp, dmar_uint->drhd->reg_base_addr + offset + 4);
+	mmio_write_long(temp, HPA2HVA(dmar_uint->drhd->reg_base_addr + offset + 4));
+}
+
+/* flush cache when root table, context table updated */
+static void iommu_flush_cache(struct dmar_drhd_rt *dmar_uint,
+			      void *p, uint32_t size)
+{
+	uint32_t i;
+
+	/* if vtd support page-walk coherency, no need to flush cacheline */
+	if (iommu_ecap_c(dmar_uint->ecap))
+		return;
+
+	for (i = 0; i < size; i += CACHE_LINE_SIZE)
+		clflush((char *)p + i);
 }
 
 #if DBG_IOMMU
@@ -523,7 +536,7 @@ static struct iommu_domain *create_host_domain(void)
 	domain->is_host = true;
 	domain->dom_id = alloc_domain_id();
 	/* dmar uint need to support translation passthrough */
-	domain->trans_table_ptr = NULL;
+	domain->trans_table_ptr = 0;
 	domain->addr_width = 48;
 
 	return domain;
@@ -854,7 +867,7 @@ static void dmar_disable(struct dmar_drhd_rt *dmar_uint)
 	dmar_fault_event_mask(dmar_uint);
 }
 
-struct iommu_domain *create_iommu_domain(int vm_id, void *translation_table,
+struct iommu_domain *create_iommu_domain(int vm_id, uint64_t translation_table,
 		int addr_width)
 {
 	struct iommu_domain *domain;
@@ -952,30 +965,42 @@ static int add_iommu_device(struct iommu_domain *domain, uint16_t segment,
 	}
 
 	if (dmar_uint->root_table_addr == 0) {
-		/* 1:1 mapping for hypervisor HEAP,
-		 * physical address equals virtual address
-		 */
-		dmar_uint->root_table_addr =
-			(uint64_t)alloc_paging_struct();
+		void *root_table_vaddr = alloc_paging_struct();
+
+		if (root_table_vaddr) {
+			dmar_uint->root_table_addr = HVA2HPA(root_table_vaddr);
+		} else {
+			ASSERT(0, "failed to allocate root table!");
+			return 1;
+		}
 	}
 
-	root_table = (uint64_t *)dmar_uint->root_table_addr;
+	root_table = (uint64_t *)HPA2HVA(dmar_uint->root_table_addr);
 
 	root_entry = (struct dmar_root_entry *)&root_table[bus * 2];
 
 	if (!DMAR_GET_BITSLICE(root_entry->lower, ROOT_ENTRY_LOWER_PRESENT)) {
-		/* create context table for the bus if not present */
-		context_table_addr =
-			(uint64_t)alloc_paging_struct();
+		void *vaddr = alloc_paging_struct();
 
-		context_table_addr = context_table_addr >> 12;
+		if (vaddr) {
+			/* create context table for the bus if not present */
+			context_table_addr = HVA2HPA(vaddr);
 
-		lower = DMAR_SET_BITSLICE(lower, ROOT_ENTRY_LOWER_CTP,
-					  context_table_addr);
-		lower = DMAR_SET_BITSLICE(lower, ROOT_ENTRY_LOWER_PRESENT, 1);
+			context_table_addr = context_table_addr >> 12;
 
-		root_entry->upper = 0;
-		root_entry->lower = lower;
+			lower = DMAR_SET_BITSLICE(lower, ROOT_ENTRY_LOWER_CTP,
+					context_table_addr);
+			lower = DMAR_SET_BITSLICE(lower,
+					ROOT_ENTRY_LOWER_PRESENT, 1);
+
+			root_entry->upper = 0;
+			root_entry->lower = lower;
+			iommu_flush_cache(dmar_uint, root_entry,
+				sizeof(struct dmar_root_entry));
+		} else {
+			ASSERT(0, "failed to allocate context table!");
+			return 1;
+		}
 	} else {
 		context_table_addr = DMAR_GET_BITSLICE(root_entry->lower,
 				ROOT_ENTRY_LOWER_CTP);
@@ -983,7 +1008,7 @@ static int add_iommu_device(struct iommu_domain *domain, uint16_t segment,
 
 	context_table_addr = context_table_addr << 12;
 
-	context_table = (uint64_t *)context_table_addr;
+	context_table = (uint64_t *)HPA2HVA(context_table_addr);
 	context_entry = (struct dmar_context_entry *)&context_table[devfun * 2];
 
 	/* the context entry should not be present */
@@ -1024,11 +1049,13 @@ static int add_iommu_device(struct iommu_domain *domain, uint16_t segment,
 
 	upper = DMAR_SET_BITSLICE(upper, CTX_ENTRY_UPPER_DID, domain->dom_id);
 	lower = DMAR_SET_BITSLICE(lower, CTX_ENTRY_LOWER_SLPTPTR,
-				  (uint64_t)domain->trans_table_ptr >> 12);
+				  domain->trans_table_ptr >> 12);
 	lower = DMAR_SET_BITSLICE(lower, CTX_ENTRY_LOWER_P, 1);
 
 	context_entry->upper = upper;
 	context_entry->lower = lower;
+	iommu_flush_cache(dmar_uint, context_entry,
+			sizeof(struct dmar_context_entry));
 
 	return 0;
 }
@@ -1054,13 +1081,13 @@ remove_iommu_device(struct iommu_domain *domain, uint16_t segment,
 		return 1;
 	}
 
-	root_table = (uint64_t *)dmar_uint->root_table_addr;
+	root_table = (uint64_t *)HPA2HVA(dmar_uint->root_table_addr);
 	root_entry = (struct dmar_root_entry *)&root_table[bus * 2];
 
 	context_table_addr = DMAR_GET_BITSLICE(root_entry->lower,
 						   ROOT_ENTRY_LOWER_CTP);
 	context_table_addr = context_table_addr << 12;
-	context_table = (uint64_t *)context_table_addr;
+	context_table = (uint64_t *)HPA2HVA(context_table_addr);
 
 	context_entry = (struct dmar_context_entry *)&context_table[devfun * 2];
 
@@ -1073,6 +1100,8 @@ remove_iommu_device(struct iommu_domain *domain, uint16_t segment,
 	/* clear the present bit first */
 	context_entry->lower = 0;
 	context_entry->upper = 0;
+	iommu_flush_cache(dmar_uint, context_entry,
+			sizeof(struct dmar_context_entry));
 
 	/* if caching mode is present, need to invalidate translation cache */
 	/* if(cap_caching_mode(dmar_uint->cap)) { */

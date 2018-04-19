@@ -40,7 +40,7 @@ extern struct efi_ctx* efi_ctx;
 
 #define PAT_POWER_ON_VALUE	(PAT_MEM_TYPE_WB + \
 				((uint64_t)PAT_MEM_TYPE_WT << 8) + \
-				((uint64_t)PAT_MEM_TYPE_UCM << 16) + \
+				((uint64_t)PAT_MEM_TYPE_WC << 16) + \
 				((uint64_t)PAT_MEM_TYPE_UC << 24) + \
 				((uint64_t)PAT_MEM_TYPE_WB << 32) + \
 				((uint64_t)PAT_MEM_TYPE_WT << 40) + \
@@ -98,17 +98,18 @@ int exec_vmxon_instr(void)
 	uint64_t tmp64;
 	uint32_t tmp32;
 	int ret_val = -EINVAL;
-	void *vmxon_region;
+	void *vmxon_region_va;
+	uint64_t vmxon_region_pa;
 
 	/* Allocate page aligned memory for VMXON region */
-	vmxon_region = alloc_page();
+	vmxon_region_va = alloc_page();
 
-	if (vmxon_region != 0) {
+	if (vmxon_region_va != 0) {
 		/* Initialize vmxon page with revision id from IA32 VMX BASIC
 		 * MSR
 		 */
 		tmp32 = msr_read(MSR_IA32_VMX_BASIC);
-		memcpy_s((uint32_t *) vmxon_region, 4, &tmp32, 4);
+		memcpy_s((uint32_t *) vmxon_region_va, 4, &tmp32, 4);
 
 		/* Turn on CR0.NE and CR4.VMXE */
 		CPU_CR_READ(cr0, &tmp64);
@@ -117,7 +118,8 @@ int exec_vmxon_instr(void)
 		CPU_CR_WRITE(cr4, tmp64 | CR4_VMXE);
 
 		/* Turn ON VMX */
-		ret_val = exec_vmxon(&vmxon_region);
+		vmxon_region_pa = HVA2HPA(vmxon_region_va);
+		ret_val = exec_vmxon(&vmxon_region_pa);
 	}
 
 	return ret_val;
@@ -270,7 +272,7 @@ static void init_guest_state(struct vcpu *vcpu)
 	} else if (get_vcpu_mode(vcpu) == PAGE_PROTECTED_MODE) {
 		cur_context->cr0 = ((uint64_t)CR0_PG | CR0_PE | CR0_NE);
 		cur_context->cr4 = ((uint64_t)CR4_PSE | CR4_PAE | CR4_MCE | CR4_VMXE);
-		cur_context->cr3 = (uint64_t)vm->arch_vm.guest_pml4 | CR3_PWT;
+		cur_context->cr3 = vm->arch_vm.guest_init_pml4 | CR3_PWT;
 	}
 
 	value = cur_context->cr0;
@@ -825,9 +827,9 @@ static void init_host_state(__unused struct vcpu *vcpu)
 
 	/* Set up host instruction pointer on VM Exit */
 	field = VMX_HOST_RIP;
-	value32 = (uint32_t) ((uint64_t) (&vm_exit) & 0xFFFFFFFF);
+	value64 = (uint64_t)&vm_exit;
 	pr_dbg("HOST RIP on VMExit %x ", value32);
-	exec_vmwrite(field, value32);
+	exec_vmwrite(field, value64);
 	pr_dbg("vm exit return address = %x ", value32);
 
 	/* These fields manage host and guest system calls * pg 3069 31.10.4.2
@@ -880,7 +882,7 @@ static void init_exec_ctrl(struct vcpu *vcpu)
 	 * the IA32_VMX_PROCBASED_CTRLS MSR are always read as 1 --- A.3.2
 	 */
 	value32 = msr_read(MSR_IA32_VMX_PROCBASED_CTLS);
-	value32 |= (/* VMX_PROCBASED_CTLS_TSC_OFF | */
+	value32 |= (VMX_PROCBASED_CTLS_TSC_OFF |
 		    /* VMX_PROCBASED_CTLS_RDTSC | */
 		    VMX_PROCBASED_CTLS_IO_BITMAP |
 		    VMX_PROCBASED_CTLS_MSR_BITMAP |
@@ -908,8 +910,8 @@ static void init_exec_ctrl(struct vcpu *vcpu)
 	 */
 	value32 = msr_read(MSR_IA32_VMX_PROCBASED_CTLS2);
 	value32 |= (VMX_PROCBASED_CTLS2_EPT |
-		    /* VMX_PROCBASED_CTLS2_RDTSCP | */
-		    VMX_PROCBASED_CTLS2_UNRESTRICT);
+			VMX_PROCBASED_CTLS2_RDTSCP |
+			VMX_PROCBASED_CTLS2_UNRESTRICT);
 
 	if (is_vapic_supported()) {
 		value32 |= VMX_PROCBASED_CTLS2_VAPIC;
@@ -929,6 +931,11 @@ static void init_exec_ctrl(struct vcpu *vcpu)
 			 * - pg 2904 24.6.8
 			 */
 			exec_vmwrite(VMX_TPR_THRESHOLD, 0);
+	}
+
+	if (cpu_has_cap(X86_FEATURE_OSXSAVE)) {
+		exec_vmwrite64(VMX_XSS_EXITING_BITMAP_FULL, 0);
+		value32 |= VMX_PROCBASED_CTLS2_XSVE_XRSTR;
 	}
 
 	exec_vmwrite(VMX_PROC_VM_EXEC_CONTROLS2, value32);
@@ -967,7 +974,7 @@ static void init_exec_ctrl(struct vcpu *vcpu)
 	 * TODO: introduce API to make this data driven based
 	 * on VMX_EPT_VPID_CAP
 	 */
-	value64 = ((uint64_t) vm->arch_vm.nworld_eptp) | (3 << 3) | 6;
+	value64 = vm->arch_vm.nworld_eptp | (3 << 3) | 6;
 	exec_vmwrite64(VMX_EPT_POINTER_FULL, value64);
 	pr_dbg("VMX_EPT_POINTER: 0x%016llx ", value64);
 
@@ -998,10 +1005,10 @@ static void init_exec_ctrl(struct vcpu *vcpu)
 	exec_vmwrite(VMX_CR3_TARGET_COUNT, 0);
 
 	/* Set up IO bitmap register A and B - pg 2902 24.6.4 */
-	value64 = (int64_t) vm->arch_vm.iobitmap[0];
+	value64 = HVA2HPA(vm->arch_vm.iobitmap[0]);
 	exec_vmwrite64(VMX_IO_BITMAP_A_FULL, value64);
 	pr_dbg("VMX_IO_BITMAP_A: 0x%016llx ", value64);
-	value64 = (int64_t) vm->arch_vm.iobitmap[1];
+	value64 = HVA2HPA(vm->arch_vm.iobitmap[1]);
 	exec_vmwrite64(VMX_IO_BITMAP_B_FULL, value64);
 	pr_dbg("VMX_IO_BITMAP_B: 0x%016llx ", value64);
 
@@ -1011,7 +1018,7 @@ static void init_exec_ctrl(struct vcpu *vcpu)
 	exec_vmwrite64(VMX_EXECUTIVE_VMCS_PTR_FULL, 0);
 
 	/* Setup Time stamp counter offset - pg 2902 24.6.5 */
-	/* exec_vmwrite64(VMX_TSC_OFFSET_FULL, VMX_TSC_OFFSET_HIGH, 0); */
+	exec_vmwrite64(VMX_TSC_OFFSET_FULL, 0);
 
 	/* Set up the link pointer */
 	exec_vmwrite64(VMX_VMS_LINK_PTR_FULL, 0xFFFFFFFFFFFFFFFF);
@@ -1296,6 +1303,7 @@ int init_vmcs(struct vcpu *vcpu)
 {
 	uint32_t vmx_rev_id;
 	int status = 0;
+	uint64_t vmcs_pa;
 
 	if (vcpu == NULL)
 		status = -EINVAL;
@@ -1309,11 +1317,12 @@ int init_vmcs(struct vcpu *vcpu)
 	memcpy_s((void *) vcpu->arch_vcpu.vmcs, 4, &vmx_rev_id, 4);
 
 	/* Execute VMCLEAR on current VMCS */
-	status = exec_vmclear((void *)&vcpu->arch_vcpu.vmcs);
+	vmcs_pa = HVA2HPA(vcpu->arch_vcpu.vmcs);
+	status = exec_vmclear((void *)&vmcs_pa);
 	ASSERT(status == 0, "Failed VMCLEAR during VMCS setup!");
 
 	/* Load VMCS pointer */
-	status = exec_vmptrld((void *)&vcpu->arch_vcpu.vmcs);
+	status = exec_vmptrld((void *)&vmcs_pa);
 	ASSERT(status == 0, "Failed VMCS pointer load!");
 
 	/* Initialize the Virtual Machine Control Structure (VMCS) */

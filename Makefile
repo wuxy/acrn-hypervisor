@@ -4,7 +4,7 @@
 
 MAJOR_VERSION=0
 MINOR_VERSION=1
-RC_VERSION=2
+RC_VERSION=4
 
 API_MAJOR_VERSION=1
 API_MINOR_VERSION=0
@@ -60,6 +60,7 @@ ARCH_LDSCRIPT_IN = bsp/ld/link_ram.ld.in
 
 INCLUDE_PATH += include
 INCLUDE_PATH += include/lib
+INCLUDE_PATH += include/lib/crypto
 INCLUDE_PATH += include/common
 INCLUDE_PATH += include/arch/x86
 INCLUDE_PATH += include/arch/x86/guest
@@ -70,11 +71,11 @@ INCLUDE_PATH += bsp/include
 INCLUDE_PATH += bsp/$(PLATFORM)/include/bsp
 INCLUDE_PATH += boot/include
 
-CC = gcc
-AS = as
-AR = ar
-LD = gcc
-POSTLD = objcopy
+CC ?= gcc
+AS ?= as
+AR ?= ar
+LD ?= ld
+OBJCOPY ?= objcopy
 
 D_SRCS += $(wildcard debug/*.c)
 C_SRCS += boot/acpi.c
@@ -103,6 +104,7 @@ C_SRCS += arch/x86/vmexit.c
 C_SRCS += arch/x86/vmx.c
 C_SRCS += arch/x86/assign.c
 C_SRCS += arch/x86/trusty.c
+C_SRCS += arch/x86/cpu_state_tbl.c
 C_SRCS += arch/x86/guest/vcpu.c
 C_SRCS += arch/x86/guest/vm.c
 C_SRCS += arch/x86/guest/instr_emul_wrapper.c
@@ -134,6 +136,7 @@ C_SRCS += lib/crypto/hkdf.c
 C_SRCS += lib/sprintf.c
 C_SRCS += common/hv_main.c
 C_SRCS += common/hypercall.c
+C_SRCS += common/trusty_hypercall.c
 C_SRCS += common/schedule.c
 C_SRCS += common/vm_load.c
 
@@ -187,14 +190,14 @@ install: efi
 endif
 
 $(HV_OBJDIR)/$(HV_FILE).32.out: $(HV_OBJDIR)/$(HV_FILE).out
-	$(POSTLD) -S --section-alignment=0x1000 -O elf32-i386 $< $@
+	$(OBJCOPY) -S --section-alignment=0x1000 -O elf32-i386 $< $@
 
 $(HV_OBJDIR)/$(HV_FILE).bin: $(HV_OBJDIR)/$(HV_FILE).out
-	$(POSTLD) -O binary $< $(HV_OBJDIR)/$(HV_FILE).bin
+	$(OBJCOPY) -O binary $< $(HV_OBJDIR)/$(HV_FILE).bin
 
 $(HV_OBJDIR)/$(HV_FILE).out: $(C_OBJS) $(S_OBJS)
 	$(CC) -E -x c $(patsubst %, -I%, $(INCLUDE_PATH)) $(ARCH_LDSCRIPT_IN) | grep -v '^#' > $(ARCH_LDSCRIPT)
-	$(LD) -Wl,-Map=$(HV_OBJDIR)/$(HV_FILE).map -o $@ $(LDFLAGS) $(ARCH_LDFLAGS) -T$(ARCH_LDSCRIPT) $^
+	$(CC) -Wl,-Map=$(HV_OBJDIR)/$(HV_FILE).map -o $@ $(LDFLAGS) $(ARCH_LDFLAGS) -T$(ARCH_LDSCRIPT) $^
 
 .PHONY: clean
 clean:

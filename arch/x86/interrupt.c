@@ -215,11 +215,11 @@ void dump_lapic(void)
 {
 	dev_dbg(ACRN_DBG_INTR,
 		"LAPIC: TIME %08x, init=0x%x cur=0x%x ISR=0x%x IRR=0x%x",
-		mmio_read_long(0xFEE00000 + LAPIC_LVT_TIMER_REGISTER),
-		mmio_read_long(0xFEE00000 + LAPIC_INITIAL_COUNT_REGISTER),
-		mmio_read_long(0xFEE00000 + LAPIC_CURRENT_COUNT_REGISTER),
-		mmio_read_long(0xFEE00000 + LAPIC_IN_SERVICE_REGISTER_7),
-		mmio_read_long(0xFEE00000 + LAPIC_INT_REQUEST_REGISTER_7));
+		mmio_read_long(HPA2HVA(LAPIC_BASE + LAPIC_LVT_TIMER_REGISTER)),
+		mmio_read_long(HPA2HVA(LAPIC_BASE + LAPIC_INITIAL_COUNT_REGISTER)),
+		mmio_read_long(HPA2HVA(LAPIC_BASE + LAPIC_CURRENT_COUNT_REGISTER)),
+		mmio_read_long(HPA2HVA(LAPIC_BASE + LAPIC_IN_SERVICE_REGISTER_7)),
+		mmio_read_long(HPA2HVA(LAPIC_BASE + LAPIC_INT_REQUEST_REGISTER_7)));
 }
 
 int vcpu_inject_extint(struct vcpu *vcpu)
@@ -237,7 +237,7 @@ int vcpu_inject_gp(struct vcpu *vcpu)
 	return vcpu_make_request(vcpu, ACRN_REQUEST_GP);
 }
 
-int interrupt_win_exiting_handler(struct vcpu *vcpu)
+int interrupt_window_vmexit_handler(struct vcpu *vcpu)
 {
 	int value32;
 
@@ -264,7 +264,7 @@ int interrupt_win_exiting_handler(struct vcpu *vcpu)
 	return 0;
 }
 
-int external_interrupt_handler(struct vcpu *vcpu)
+int external_interrupt_vmexit_handler(struct vcpu *vcpu)
 {
 	int vector = exec_vmread(VMX_EXIT_INT_INFO) & 0xFF;
 	struct intr_ctx ctx;
@@ -289,7 +289,7 @@ int acrn_do_intr_process(struct vcpu *vcpu)
 	uint64_t *pending_intr_bits = &vcpu->arch_vcpu.pending_intr;
 
 	if (bitmap_test_and_clear(ACRN_REQUEST_TLB_FLUSH, pending_intr_bits))
-		mmu_invept(vcpu);
+		invept(vcpu);
 
 	if (bitmap_test_and_clear(ACRN_REQUEST_TMR_UPDATE, pending_intr_bits))
 		vioapic_update_tmr(vcpu);
@@ -309,9 +309,9 @@ int acrn_do_intr_process(struct vcpu *vcpu)
 	/* handling pending vector injection:
 	 * there are many reason inject failed, we need re-inject again
 	 */
-	if (vcpu->arch_vcpu.exit_interrupt_info & VMX_INT_INFO_VALID) {
+	if (vcpu->arch_vcpu.idt_vectoring_info & VMX_INT_INFO_VALID) {
 		exec_vmwrite(VMX_ENTRY_INT_INFO_FIELD,
-				vcpu->arch_vcpu.exit_interrupt_info);
+				vcpu->arch_vcpu.idt_vectoring_info);
 		goto INTR_WIN;
 	}
 
@@ -417,10 +417,10 @@ void cancel_event_injection(struct vcpu *vcpu)
 	}
 }
 
-int exception_handler(struct vcpu *vcpu)
+int exception_vmexit_handler(struct vcpu *vcpu)
 {
-	uint32_t intinfo, int_err_code;
-	uint32_t exception_vector;
+	uint32_t intinfo, int_err_code = 0;
+	int32_t exception_vector = -1;
 	uint32_t cpl;
 	int status = 0;
 
@@ -436,24 +436,24 @@ int exception_handler(struct vcpu *vcpu)
 
 	/* Obtain VM-Exit information field pg 2912 */
 	intinfo = exec_vmread(VMX_EXIT_INT_INFO);
-	exception_vector = intinfo & 0xFF;
-	/* Check if exception caused by the guest is a HW exception. If the
-	 * exit occurred due to a HW exception obtain the error code to be
-	 * conveyed to get via the stack
-	 */
-	if (intinfo & VMX_INT_INFO_ERR_CODE_VALID) {
-		int_err_code = exec_vmread(VMX_EXIT_INT_EC);
+	if (intinfo & VMX_INT_INFO_VALID) {
+		exception_vector = intinfo & 0xFF;
+		/* Check if exception caused by the guest is a HW exception.
+		 * If the exit occurred due to a HW exception obtain the
+		 * error code to be conveyed to get via the stack
+		 */
+		if (intinfo & VMX_INT_INFO_ERR_CODE_VALID) {
+			int_err_code = exec_vmread(VMX_EXIT_INT_EC);
 
-		/* get current privilege level and fault address */
-		cpl = exec_vmread(VMX_GUEST_CS_ATTR);
-		cpl = (cpl >> 5) & 3;
+			/* get current privilege level and fault address */
+			cpl = exec_vmread(VMX_GUEST_CS_ATTR);
+			cpl = (cpl >> 5) & 3;
 
-		if (cpl < 3)
-			int_err_code &= ~4;
-		else
-			int_err_code |= 4;
-	} else {
-		int_err_code = 0;
+			if (cpl < 3)
+				int_err_code &= ~4;
+			else
+				int_err_code |= 4;
+		}
 	}
 
 	/* Handle all other exceptions */

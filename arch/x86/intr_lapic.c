@@ -158,23 +158,26 @@ union lapic_base_msr {
 struct lapic_info {
 	int init_status;
 	struct {
-		paddr_t paddr;
-		vaddr_t vaddr;
+		uint64_t paddr;
+		void *vaddr;
 	} xapic;
-
 };
 
 static struct lapic_info lapic_info;
 
-static uint32_t read_lapic_reg32(uint32_t offset)
+static inline uint32_t read_lapic_reg32(uint32_t offset)
 {
-	ASSERT((offset >= 0x020) && (offset <= 0x3FF), "");
+	if (offset < 0x20 || offset > 0x3ff)
+		return 0;
+
 	return mmio_read_long(lapic_info.xapic.vaddr + offset);
 }
 
-static void write_lapic_reg32(uint32_t offset, uint32_t value)
+inline void write_lapic_reg32(uint32_t offset, uint32_t value)
 {
-	ASSERT((offset >= 0x020) && (offset <= 0x3FF), "");
+	if (offset < 0x20 || offset > 0x3ff)
+		return;
+
 	mmio_write_long(value, lapic_info.xapic.vaddr + offset);
 }
 
@@ -201,7 +204,7 @@ static void map_lapic(void)
 	/* At some point we may need to translate this paddr to a vaddr. 1:1
 	 * mapping for now.
 	 */
-	lapic_info.xapic.vaddr = lapic_info.xapic.paddr;
+	lapic_info.xapic.vaddr = HPA2HVA(lapic_info.xapic.paddr);
 }
 
 int early_init_lapic(void)
@@ -320,7 +323,7 @@ uint32_t get_cur_lapic_id(void)
 
 int
 send_startup_ipi(enum intr_cpu_startup_shorthand cpu_startup_shorthand,
-	uint32_t cpu_startup_dest, paddr_t cpu_startup_start_address)
+	uint32_t cpu_startup_dest, uint64_t cpu_startup_start_address)
 {
 	union apic_icr icr;
 	uint8_t shorthand;
@@ -368,7 +371,7 @@ send_startup_ipi(enum intr_cpu_startup_shorthand cpu_startup_shorthand,
 	icr.value_32.lo_32 = 0;
 	icr.bits.shorthand = shorthand;
 	icr.bits.delivery_mode = INTR_LAPIC_ICR_STARTUP;
-	icr.bits.vector = ((paddr_t) cpu_startup_start_address) >> 12;
+	icr.bits.vector = ((uint64_t) cpu_startup_start_address) >> 12;
 	write_lapic_reg32(LAPIC_INT_COMMAND_REGISTER_0, icr.value_32.lo_32);
 	wait_for_delivery();
 

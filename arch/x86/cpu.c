@@ -36,6 +36,7 @@
 #include <schedule.h>
 #include <version.h>
 #include <hv_debug.h>
+#include <cpu_state_tbl.h>
 
 #ifdef CONFIG_EFI_STUB
 extern uint32_t efi_physical_available_ap_bitmap;
@@ -54,9 +55,12 @@ spinlock_t up_count_spinlock = {
 };
 
 void *per_cpu_data_base_ptr;
-int phy_cpu_num;
+int phy_cpu_num = 0;
 unsigned long pcpu_sync = 0;
 uint32_t up_count = 0;
+
+/* physical cpu active bitmap, support up to 64 cpus */
+uint64_t pcpu_active_bitmap = 0;
 
 DEFINE_CPU_DATA(uint8_t[STACK_SIZE], stack) __aligned(16);
 DEFINE_CPU_DATA(uint8_t, lapic_id);
@@ -80,34 +84,30 @@ static struct cpu_capability cpu_caps;
 struct cpuinfo_x86 boot_cpu_data;
 
 static void vapic_cap_detect(void);
+static void cpu_xsave_init(void);
 static void cpu_set_logical_id(uint32_t logical_id);
 static void print_hv_banner(void);
 int cpu_find_logical_id(uint32_t lapic_id);
 #ifndef CONFIG_EFI_STUB
-static void start_cpus();
+static void start_cpus(void);
 #endif
 static void pcpu_sync_sleep(unsigned long *sync, int mask_bit);
 int ibrs_type;
 
-static inline bool get_tsc_adjust_cap(void)
+inline bool cpu_has_cap(uint32_t bit)
 {
-	return !!(boot_cpu_data.cpuid_leaves[FEAT_7_0_EBX] & CPUID_EBX_TSC_ADJ);
-}
+	int feat_idx = bit >> 5;
+	int feat_bit = bit & 0x1f;
 
-static inline bool get_ibrs_ibpb_cap(void)
-{
-	return !!(boot_cpu_data.cpuid_leaves[FEAT_7_0_EDX] &
-		CPUID_EDX_IBRS_IBPB);
-}
+	if (feat_idx >= FEATURE_WORDS)
+		return false;
 
-static inline bool get_stibp_cap(void)
-{
-	return !!(boot_cpu_data.cpuid_leaves[FEAT_7_0_EDX] & CPUID_EDX_STIBP);
+	return !!(boot_cpu_data.cpuid_leaves[feat_idx] & (1 << feat_bit));
 }
 
 static inline bool get_monitor_cap(void)
 {
-	if (boot_cpu_data.cpuid_leaves[FEAT_1_ECX] & CPUID_ECX_MONITOR) {
+	if (cpu_has_cap(X86_FEATURE_MONITOR)) {
 		/* don't use monitor for CPU (family: 0x6 model: 0x5c)
 		 * in hypervisor, but still expose it to the guests and
 		 * let them handle it correctly
@@ -119,14 +119,15 @@ static inline bool get_monitor_cap(void)
 	return false;
 }
 
-inline bool get_vmx_cap(void)
+static uint64_t get_address_mask(uint8_t limit)
 {
-	return !!(boot_cpu_data.cpuid_leaves[FEAT_1_ECX] & CPUID_ECX_VMX);
+	return ((1ULL << limit) - 1) & CPU_PAGE_MASK;
 }
 
 static void get_cpu_capabilities(void)
 {
 	uint32_t eax, unused;
+	uint32_t max_extended_function_idx;
 	uint32_t family, model;
 
 	cpuid(CPUID_FEATURES, &eax, &unused,
@@ -148,9 +149,28 @@ static void get_cpu_capabilities(void)
 		&boot_cpu_data.cpuid_leaves[FEAT_7_0_ECX],
 		&boot_cpu_data.cpuid_leaves[FEAT_7_0_EDX]);
 
+	cpuid(CPUID_MAX_EXTENDED_FUNCTION,
+		&max_extended_function_idx,
+		&unused, &unused, &unused);
+	boot_cpu_data.cpuid_leaves[FEAT_8000_0000_EAX] =
+		max_extended_function_idx;
+
+	if (max_extended_function_idx < CPUID_EXTEND_ADDRESS_SIZE) {
+		panic("CPU w/o CPUID.80000008H is not supported");
+	}
+
 	cpuid(CPUID_EXTEND_FUNCTION_1, &unused, &unused,
 		&boot_cpu_data.cpuid_leaves[FEAT_8000_0001_ECX],
 		&boot_cpu_data.cpuid_leaves[FEAT_8000_0001_EDX]);
+
+	cpuid(CPUID_EXTEND_ADDRESS_SIZE,
+		&eax, &unused, &unused, &unused);
+	boot_cpu_data.cpuid_leaves[FEAT_8000_0008_EAX] = eax;
+	/* EAX bits 07-00: #Physical Address Bits
+	 *     bits 15-08: #Linear Address Bits
+	 */
+	boot_cpu_data.physical_address_mask =
+		get_address_mask(eax & 0xff);
 
 	/* For speculation defence.
 	 * The default way is to set IBRS at vmexit and then do IBPB at vcpu
@@ -168,9 +188,9 @@ static void get_cpu_capabilities(void)
 	 * should be set all the time instead of relying on retpoline
 	 */
 #ifndef CONFIG_RETPOLINE
-	if (get_ibrs_ibpb_cap()) {
+	if (cpu_has_cap(X86_FEATURE_IBRS_IBPB)) {
 		ibrs_type = IBRS_RAW;
-		if (get_stibp_cap())
+		if (cpu_has_cap(X86_FEATURE_STIBP))
 			ibrs_type = IBRS_OPT;
 	}
 #endif
@@ -206,7 +226,7 @@ static int init_phy_cpu_storage(void)
 	 * allocate memory to save all lapic_id detected in parse_mdt.
 	 * We allocate 4K size which could save 4K CPUs lapic_id info.
 	 */
-	lapic_id_base = alloc_page(CPU_PAGE_SIZE);
+	lapic_id_base = alloc_page();
 	ASSERT(lapic_id_base != NULL, "fail to alloc page");
 
 	pcpu_num = parse_madt(lapic_id_base);
@@ -282,6 +302,27 @@ static void set_fs_base(void)
 }
 #endif
 
+static void get_cpu_name(void)
+{
+	cpuid(CPUID_EXTEND_FUNCTION_2,
+		(uint32_t *)(boot_cpu_data.model_name),
+		(uint32_t *)(boot_cpu_data.model_name + 4),
+		(uint32_t *)(boot_cpu_data.model_name + 8),
+		(uint32_t *)(boot_cpu_data.model_name + 12));
+	cpuid(CPUID_EXTEND_FUNCTION_3,
+		(uint32_t *)(boot_cpu_data.model_name + 16),
+		(uint32_t *)(boot_cpu_data.model_name + 20),
+		(uint32_t *)(boot_cpu_data.model_name + 24),
+		(uint32_t *)(boot_cpu_data.model_name + 28));
+	cpuid(CPUID_EXTEND_FUNCTION_4,
+		(uint32_t *)(boot_cpu_data.model_name + 32),
+		(uint32_t *)(boot_cpu_data.model_name + 36),
+		(uint32_t *)(boot_cpu_data.model_name + 40),
+		(uint32_t *)(boot_cpu_data.model_name + 44));
+
+	boot_cpu_data.model_name[48] = '\0';
+}
+
 void bsp_boot_init(void)
 {
 	uint64_t start_tsc = rdtsc();
@@ -292,40 +333,68 @@ void bsp_boot_init(void)
 	/* Build time sanity checks to make sure hard-coded offset
 	*  is matching the actual offset!
 	*/
-	STATIC_ASSERT(offsetof(struct cpu_regs, rax) ==
-		VMX_MACHINE_T_GUEST_RAX_OFFSET);
-	STATIC_ASSERT(offsetof(struct cpu_regs, rbx) ==
-		VMX_MACHINE_T_GUEST_RBX_OFFSET);
-	STATIC_ASSERT(offsetof(struct cpu_regs, rcx) ==
-		VMX_MACHINE_T_GUEST_RCX_OFFSET);
-	STATIC_ASSERT(offsetof(struct cpu_regs, rdx) ==
-		VMX_MACHINE_T_GUEST_RDX_OFFSET);
-	STATIC_ASSERT(offsetof(struct cpu_regs, rbp) ==
-		VMX_MACHINE_T_GUEST_RBP_OFFSET);
-	STATIC_ASSERT(offsetof(struct cpu_regs, rsi) ==
-		VMX_MACHINE_T_GUEST_RSI_OFFSET);
-	STATIC_ASSERT(offsetof(struct cpu_regs, rdi) ==
-		VMX_MACHINE_T_GUEST_RDI_OFFSET);
-	STATIC_ASSERT(offsetof(struct cpu_regs, r8) ==
-		VMX_MACHINE_T_GUEST_R8_OFFSET);
-	STATIC_ASSERT(offsetof(struct cpu_regs, r9) ==
-		VMX_MACHINE_T_GUEST_R9_OFFSET);
-	STATIC_ASSERT(offsetof(struct cpu_regs, r10) ==
-		VMX_MACHINE_T_GUEST_R10_OFFSET);
-	STATIC_ASSERT(offsetof(struct cpu_regs, r11) ==
-		VMX_MACHINE_T_GUEST_R11_OFFSET);
-	STATIC_ASSERT(offsetof(struct cpu_regs, r12) ==
-		VMX_MACHINE_T_GUEST_R12_OFFSET);
-	STATIC_ASSERT(offsetof(struct cpu_regs, r13) ==
-		VMX_MACHINE_T_GUEST_R13_OFFSET);
-	STATIC_ASSERT(offsetof(struct cpu_regs, r14) ==
-		VMX_MACHINE_T_GUEST_R14_OFFSET);
-	STATIC_ASSERT(offsetof(struct cpu_regs, r15) ==
-		VMX_MACHINE_T_GUEST_R15_OFFSET);
-	STATIC_ASSERT(offsetof(struct run_context, cr2) ==
-		VMX_MACHINE_T_GUEST_CR2_OFFSET);
-	STATIC_ASSERT(offsetof(struct run_context, ia32_spec_ctrl) ==
-		VMX_MACHINE_T_GUEST_SPEC_CTRL_OFFSET);
+	_Static_assert(offsetof(struct cpu_regs, rax) ==
+		VMX_MACHINE_T_GUEST_RAX_OFFSET,
+		"cpu_regs rax offset not match");
+	_Static_assert(offsetof(struct cpu_regs, rbx) ==
+		VMX_MACHINE_T_GUEST_RBX_OFFSET,
+		"cpu_regs rbx offset not match");
+	_Static_assert(offsetof(struct cpu_regs, rcx) ==
+		VMX_MACHINE_T_GUEST_RCX_OFFSET,
+		"cpu_regs rcx offset not match");
+	_Static_assert(offsetof(struct cpu_regs, rdx) ==
+		VMX_MACHINE_T_GUEST_RDX_OFFSET,
+		"cpu_regs rdx offset not match");
+	_Static_assert(offsetof(struct cpu_regs, rbp) ==
+		VMX_MACHINE_T_GUEST_RBP_OFFSET,
+		"cpu_regs rbp offset not match");
+	_Static_assert(offsetof(struct cpu_regs, rsi) ==
+		VMX_MACHINE_T_GUEST_RSI_OFFSET,
+		"cpu_regs rsi offset not match");
+	_Static_assert(offsetof(struct cpu_regs, rdi) ==
+		VMX_MACHINE_T_GUEST_RDI_OFFSET,
+		"cpu_regs rdi offset not match");
+	_Static_assert(offsetof(struct cpu_regs, r8) ==
+		VMX_MACHINE_T_GUEST_R8_OFFSET,
+		"cpu_regs r8 offset not match");
+	_Static_assert(offsetof(struct cpu_regs, r9) ==
+		VMX_MACHINE_T_GUEST_R9_OFFSET,
+		"cpu_regs r9 offset not match");
+	_Static_assert(offsetof(struct cpu_regs, r10) ==
+		VMX_MACHINE_T_GUEST_R10_OFFSET,
+		"cpu_regs r10 offset not match");
+	_Static_assert(offsetof(struct cpu_regs, r11) ==
+		VMX_MACHINE_T_GUEST_R11_OFFSET,
+		"cpu_regs r11 offset not match");
+	_Static_assert(offsetof(struct cpu_regs, r12) ==
+		VMX_MACHINE_T_GUEST_R12_OFFSET,
+		"cpu_regs r12 offset not match");
+	_Static_assert(offsetof(struct cpu_regs, r13) ==
+		VMX_MACHINE_T_GUEST_R13_OFFSET,
+		"cpu_regs r13 offset not match");
+	_Static_assert(offsetof(struct cpu_regs, r14) ==
+		VMX_MACHINE_T_GUEST_R14_OFFSET,
+		"cpu_regs r14 offset not match");
+	_Static_assert(offsetof(struct cpu_regs, r15) ==
+		VMX_MACHINE_T_GUEST_R15_OFFSET,
+		"cpu_regs r15 offset not match");
+	_Static_assert(offsetof(struct run_context, cr2) ==
+		VMX_MACHINE_T_GUEST_CR2_OFFSET,
+		"run_context cr2 offset not match");
+	_Static_assert(offsetof(struct run_context, ia32_spec_ctrl) ==
+		VMX_MACHINE_T_GUEST_SPEC_CTRL_OFFSET,
+		"run_context ia32_spec_ctrl offset not match");
+
+	bitmap_set(CPU_BOOT_ID, &pcpu_active_bitmap);
+
+	/* Get CPU capabilities thru CPUID, including the physical address bit
+	 * limit which is required for initializing paging.
+	 */
+	get_cpu_capabilities();
+
+	get_cpu_name();
+
+	load_cpu_state_data();
 
 	/* Initialize the hypervisor paging */
 	init_paging();
@@ -343,9 +412,9 @@ void bsp_boot_init(void)
 	set_fs_base();
 #endif
 
-	get_cpu_capabilities();
-
 	vapic_cap_detect();
+
+	cpu_xsave_init();
 
 	/* Set state for this CPU to initializing */
 	cpu_set_current_state(CPU_BOOT_ID, CPU_STATE_INITIALIZING);
@@ -386,10 +455,13 @@ void bsp_boot_init(void)
 	printf("API version %d.%d\r\n",
 			HV_API_MAJOR_VERSION, HV_API_MINOR_VERSION);
 
+	printf("Detect processor: %s\n", boot_cpu_data.model_name);
+
 	pr_dbg("Core %d is up", CPU_BOOT_ID);
 
 	/* Warn for security feature not ready */
-	if (!get_ibrs_ibpb_cap() && !get_stibp_cap()) {
+	if (!cpu_has_cap(X86_FEATURE_IBRS_IBPB) &&
+			!cpu_has_cap(X86_FEATURE_STIBP)) {
 		pr_fatal("SECURITY WARNING!!!!!!");
 		pr_fatal("Please apply the latest CPU uCode patch!");
 	}
@@ -429,7 +501,7 @@ void bsp_boot_init(void)
 	hv_main(CPU_BOOT_ID);
 
 	/* Control should not come here */
-	cpu_halt(CPU_BOOT_ID);
+	cpu_dead(CPU_BOOT_ID);
 }
 
 void cpu_secondary_init(void)
@@ -459,6 +531,8 @@ void cpu_secondary_init(void)
 			      (get_cur_lapic_id()),
 			      CPU_STATE_INITIALIZING);
 
+	bitmap_set(get_cpu_id(), &pcpu_active_bitmap);
+
 	/* Switch to run-time stack */
 	CPU_SP_WRITE(&get_cpu_var(stack)[STACK_SIZE - 1]);
 
@@ -472,6 +546,8 @@ void cpu_secondary_init(void)
 	check_tsc();
 
 	pr_dbg("Core %d is up", get_cpu_id());
+
+	cpu_xsave_init();
 
 	/* Release secondary boot spin-lock to allow one of the next CPU(s) to
 	 * perform this common initialization
@@ -495,7 +571,7 @@ void cpu_secondary_init(void)
 	/* Control will only come here for secondary CPUs not configured for
 	 * use or if an error occurs in hv_main
 	 */
-	cpu_halt(get_cpu_id());
+	cpu_dead(get_cpu_id());
 }
 
 int cpu_find_logical_id(uint32_t lapic_id)
@@ -532,7 +608,7 @@ static void start_cpus()
 
 	/* Broadcast IPIs to all other CPUs */
 	send_startup_ipi(INTR_CPU_STARTUP_ALL_EX_SELF,
-		       -1U, ((paddr_t) cpu_secondary_reset));
+		       -1U, ((uint64_t) cpu_secondary_reset));
 
 	/* Wait until global count is equal to expected CPU up count or
 	 * configured time-out has expired
@@ -558,7 +634,7 @@ static void start_cpus()
 }
 #endif
 
-void cpu_halt(uint32_t logical_id)
+void cpu_dead(uint32_t logical_id)
 {
 	/* For debug purposes, using a stack variable in the while loop enables
 	 * us to modify the value using a JTAG probe and resume if needed.
@@ -567,6 +643,8 @@ void cpu_halt(uint32_t logical_id)
 
 	/* Set state to show CPU is halted */
 	cpu_set_current_state(logical_id, CPU_STATE_HALTED);
+
+	bitmap_clr(get_cpu_id(), &pcpu_active_bitmap);
 
 	/* Halt the CPU */
 	do {
@@ -681,4 +759,25 @@ bool is_vapic_intr_delivery_supported(void)
 bool is_vapic_virt_reg_supported(void)
 {
 	return ((cpu_caps.vapic_features & VAPIC_FEATURE_VIRT_REG) != 0);
+}
+
+static void cpu_xsave_init(void)
+{
+	uint64_t val64;
+
+	if (cpu_has_cap(X86_FEATURE_XSAVE)) {
+		CPU_CR_READ(cr4, &val64);
+		val64 |= CR4_OSXSAVE;
+		CPU_CR_WRITE(cr4, val64);
+
+		if (get_cpu_id() == CPU_BOOT_ID) {
+			uint32_t ecx, unused;
+			cpuid(CPUID_FEATURES, &unused, &unused, &ecx, &unused);
+
+			/* if set, update it */
+			if (ecx & CPUID_ECX_OSXSAVE)
+				boot_cpu_data.cpuid_leaves[FEAT_1_ECX] |=
+						CPUID_ECX_OSXSAVE;
+		}
+	}
 }

@@ -33,13 +33,14 @@
 #include <hv_arch.h>
 #include <hv_debug.h>
 #include <ucode.h>
+#include <cpu_state_tbl.h>
 
 /*MRS need to be emulated, the order in this array better as freq of ops*/
 static const uint32_t emulated_msrs[] = {
 	MSR_IA32_TSC_DEADLINE,  /* Enable TSC_DEADLINE VMEXIT */
 	MSR_IA32_BIOS_UPDT_TRIG, /* Enable MSR_IA32_BIOS_UPDT_TRIG */
 	MSR_IA32_BIOS_SIGN_ID, /* Enable MSR_IA32_BIOS_SIGN_ID */
-
+	MSR_IA32_TIME_STAMP_COUNTER,
 
 /* following MSR not emulated now */
 /*
@@ -48,7 +49,6 @@ static const uint32_t emulated_msrs[] = {
  *	MSR_IA32_SYSENTER_ESP,
  *	MSR_IA32_SYSENTER_EIP,
  *	MSR_IA32_TSC_AUX,
- *	MSR_IA32_TIME_STAMP_COUNTER,
  */
 };
 
@@ -57,6 +57,7 @@ enum {
 	IDX_TSC_DEADLINE,
 	IDX_BIOS_UPDT_TRIG,
 	IDX_BIOS_SIGN_ID,
+	IDX_TSC,
 
 	IDX_MAX_MSR
 };
@@ -135,6 +136,8 @@ void init_msr_emulation(struct vcpu *vcpu)
 		for (i = 0; i < msrs_count; i++)
 			enable_msr_interception(msr_bitmap, emulated_msrs[i]);
 
+		enable_msr_interception(msr_bitmap, MSR_IA32_PERF_CTL);
+
 		/* below MSR protected from guest OS, if access to inject gp*/
 		enable_msr_interception(msr_bitmap, MSR_IA32_MTRR_CAP);
 		enable_msr_interception(msr_bitmap, MSR_IA32_MTRR_DEF_TYPE);
@@ -152,10 +155,15 @@ void init_msr_emulation(struct vcpu *vcpu)
 			i <= MSR_IA32_MTRR_FIX4K_F8000; i++) {
 			enable_msr_interception(msr_bitmap, i);
 		}
+
+		for (i = MSR_IA32_VMX_BASIC;
+			i <= MSR_IA32_VMX_TRUE_ENTRY_CTLS; i++) {
+			enable_msr_interception(msr_bitmap, i);
+		}
 	}
 
 	/* Set up MSR bitmap - pg 2904 24.6.9 */
-	value64 = (int64_t) vcpu->vm->arch_vm.msr_bitmap;
+	value64 = HVA2HPA(vcpu->vm->arch_vm.msr_bitmap);
 	exec_vmwrite64(VMX_MSR_BITMAP_FULL, value64);
 	pr_dbg("VMX_MSR_BITMAP: 0x%016llx ", value64);
 
@@ -165,11 +173,10 @@ void init_msr_emulation(struct vcpu *vcpu)
 	memset(vcpu->guest_msrs, 0, msrs_count * sizeof(uint64_t));
 }
 
-int rdmsr_handler(struct vcpu *vcpu)
+int rdmsr_vmexit_handler(struct vcpu *vcpu)
 {
 	uint32_t msr;
 	uint64_t v = 0;
-	uint32_t id;
 	int cur_context = vcpu->arch_vcpu.cur_context;
 
 	/* Read the msr value */
@@ -182,11 +189,18 @@ int rdmsr_handler(struct vcpu *vcpu)
 		v = vcpu->guest_msrs[IDX_TSC_DEADLINE];
 		break;
 	}
+	case MSR_IA32_TIME_STAMP_COUNTER:
+	{
+		/* Add the TSC_offset to host TSC to get guest TSC */
+		v = rdtsc() + vcpu->arch_vcpu.contexts[cur_context].tsc_offset;
+		break;
+	}
 
 	case MSR_IA32_MTRR_CAP:
 	case MSR_IA32_MTRR_DEF_TYPE:
 	case MSR_IA32_MTRR_PHYSBASE_0 ... MSR_IA32_MTRR_PHYSMASK_9:
 	case MSR_IA32_MTRR_FIX64K_00000 ... MSR_IA32_MTRR_FIX4K_F8000:
+	case MSR_IA32_VMX_BASIC ... MSR_IA32_VMX_TRUE_ENTRY_CTLS:
 	{
 		vcpu_inject_gp(vcpu);
 		break;
@@ -194,6 +208,11 @@ int rdmsr_handler(struct vcpu *vcpu)
 	case MSR_IA32_BIOS_SIGN_ID:
 	{
 		v = get_microcode_version();
+		break;
+	}
+	case MSR_IA32_PERF_CTL:
+	{
+		v = msr_read(msr);
 		break;
 	}
 
@@ -218,25 +237,16 @@ int rdmsr_handler(struct vcpu *vcpu)
 		v = vcpu->arch_vcpu.msr_tsc_aux;
 		break;
 	}
-	case MSR_IA32_TIME_STAMP_COUNTER:
-	{
-		/* Read the host TSC value */
-		CPU_RDTSCP_EXECUTE(&v, &id);
-
-		/* Add the TSC_offset to host TSC and return the value */
-		v += exec_vmread64(VMX_TSC_OFFSET_FULL);
-		break;
-	}
 	case MSR_IA32_APIC_BASE:
 	{
-		bool ret;
 		/* Read APIC base */
-		vlapic_rdmsr(vcpu, msr, &v, &ret);
+		vlapic_rdmsr(vcpu, msr, &v);
 		break;
 	}
 	default:
 	{
 		pr_warn("rdmsr: %lx should not come here!", msr);
+		vcpu_inject_gp(vcpu);
 		v = 0;
 		break;
 	}
@@ -252,7 +262,7 @@ int rdmsr_handler(struct vcpu *vcpu)
 	return 0;
 }
 
-int wrmsr_handler(struct vcpu *vcpu)
+int wrmsr_vmexit_handler(struct vcpu *vcpu)
 {
 	uint32_t msr;
 	uint64_t v;
@@ -270,16 +280,23 @@ int wrmsr_handler(struct vcpu *vcpu)
 	switch (msr) {
 	case MSR_IA32_TSC_DEADLINE:
 	{
-		bool ret;
-		/* Write APIC base */
-		vlapic_wrmsr(vcpu, msr, v, &ret);
+		vlapic_wrmsr(vcpu, msr, v);
 		vcpu->guest_msrs[IDX_TSC_DEADLINE] = v;
 		break;
 	}
+	case MSR_IA32_TIME_STAMP_COUNTER:
+	{
+		/*Caculate TSC offset from changed TSC MSR value*/
+		cur_context->tsc_offset = v - rdtsc();
+		exec_vmwrite64(VMX_TSC_OFFSET_FULL, cur_context->tsc_offset);
+		break;
+	}
+
 	case MSR_IA32_MTRR_CAP:
 	case MSR_IA32_MTRR_DEF_TYPE:
 	case MSR_IA32_MTRR_PHYSBASE_0 ... MSR_IA32_MTRR_PHYSMASK_9:
 	case MSR_IA32_MTRR_FIX64K_00000 ... MSR_IA32_MTRR_FIX4K_F8000:
+	case MSR_IA32_VMX_BASIC ... MSR_IA32_VMX_TRUE_ENTRY_CTLS:
 	{
 		vcpu_inject_gp(vcpu);
 		break;
@@ -293,6 +310,14 @@ int wrmsr_handler(struct vcpu *vcpu)
 		/* We only allow SOS to do uCode update */
 		if (is_vm0(vcpu->vm))
 			acrn_update_ucode(vcpu, v);
+		break;
+	}
+	case MSR_IA32_PERF_CTL:
+	{
+		if (validate_pstate(vcpu->vm, v)) {
+			break;
+		}
+		msr_write(msr, v);
 		break;
 	}
 
@@ -324,15 +349,13 @@ int wrmsr_handler(struct vcpu *vcpu)
 	}
 	case MSR_IA32_APIC_BASE:
 	{
-		bool ret;
-		/* Write APIC base */
-		vlapic_wrmsr(vcpu, msr, v, &ret);
+		vlapic_wrmsr(vcpu, msr, v);
 		break;
 	}
 	default:
 	{
-		ASSERT(0, "wrmsr: %lx should not come here!", msr);
-		msr_write(msr, v);
+		pr_warn(0, "wrmsr: %lx should not come here!", msr);
+		vcpu_inject_gp(vcpu);
 		break;
 	}
 	}

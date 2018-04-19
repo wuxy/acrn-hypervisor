@@ -34,6 +34,7 @@
 #include <bsp_extern.h>
 #include <hv_debug.h>
 #include <multiboot.h>
+#include <cpu_state_tbl.h>
 
 /* Local variables */
 
@@ -153,6 +154,8 @@ int create_vm(struct vm_description *vm_desc, struct vm **rtn_vm)
 			 */
 			setup_io_bitmap(vm);
 
+			vm_setup_cpu_state(vm);
+
 			/* Create virtual uart */
 			if (is_vm0(vm))
 				vm->vuart = vuart_init(vm);
@@ -167,8 +170,7 @@ int create_vm(struct vm_description *vm_desc, struct vm **rtn_vm)
 
 			/* Populate return VM handle */
 			*rtn_vm = vm;
-			ptdev_vm_init(vm);
-			vm->sw.req_buf = 0;
+			vm->sw.req_buf = NULL;
 
 			status = set_vcpuid_entries(vm);
 			if (status)
@@ -204,11 +206,14 @@ int shutdown_vm(struct vm *vm)
 	list_del_init(&vm->list);
 	spinlock_release(&vm_list_lock);
 
-	ptdev_vm_deinit(vm);
+	ptdev_release_all_entries(vm);
 
 	/* cleanup and free vioapic */
 	vioapic_cleanup(vm->arch_vm.virt_ioapic);
 
+	/* Destroy secure world */
+	if (vm->sworld_control.sworld_enabled)
+		destroy_secure_world(vm);
 	/* Free EPT allocated resources assigned to VM */
 	destroy_ept(vm);
 

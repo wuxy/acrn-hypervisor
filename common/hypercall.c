@@ -37,8 +37,21 @@
 #include <acrn_hv_defs.h>
 #include <hv_debug.h>
 #include <version.h>
+#include <cpu_state_tbl.h>
 
 #define ACRN_DBG_HYCALL	6
+
+bool is_hypercall_from_ring0(void)
+{
+	uint64_t cs_sel;
+
+	cs_sel = exec_vmread(VMX_GUEST_CS_SEL);
+	/* cs_selector[1:0] is CPL */
+	if ((cs_sel & 0x3) == 0)
+		return true;
+
+	return false;
+}
 
 int64_t hcall_get_api_version(struct vm *vm, uint64_t param)
 {
@@ -200,7 +213,7 @@ int64_t hcall_resume_vm(uint64_t vmid)
 
 	if (target_vm == NULL)
 		return -1;
-	if (target_vm->sw.req_buf == 0)
+	if (target_vm->sw.req_buf == NULL)
 		ret = -1;
 	else
 		ret = start_vm(target_vm);
@@ -310,6 +323,7 @@ int64_t hcall_inject_msi(struct vm *vm, uint64_t vmid, uint64_t param)
 int64_t hcall_set_ioreq_buffer(struct vm *vm, uint64_t vmid, uint64_t param)
 {
 	int64_t ret = 0;
+	uint64_t hpa = 0;
 	struct acrn_set_ioreq_buffer iobuf;
 	struct vm *target_vm = get_vm_from_vmid(vmid);
 
@@ -323,11 +337,17 @@ int64_t hcall_set_ioreq_buffer(struct vm *vm, uint64_t vmid, uint64_t param)
 		return -1;
 	}
 
-	dev_dbg(ACRN_DBG_HYCALL, "[%d] SET BUFFER=0x%x",
+	dev_dbg(ACRN_DBG_HYCALL, "[%d] SET BUFFER=0x%p",
 			vmid, iobuf.req_buf);
 
-	/* store gpa of guest request_buffer */
-	target_vm->sw.req_buf = gpa2hpa(vm, iobuf.req_buf);
+	hpa = gpa2hpa(vm, iobuf.req_buf);
+	if (hpa == 0) {
+		pr_err("%s: invalid GPA.\n", __func__);
+		target_vm->sw.req_buf = NULL;
+		return -EINVAL;
+	}
+
+	target_vm->sw.req_buf = HPA2HVA(hpa);
 
 	return ret;
 }
@@ -373,8 +393,8 @@ int64_t hcall_notify_req_finish(uint64_t vmid, uint64_t vcpu_id)
 	struct vm *target_vm = get_vm_from_vmid(vmid);
 
 	/* make sure we have set req_buf */
-	if (!target_vm || target_vm->sw.req_buf == 0)
-		return -1;
+	if (!target_vm || target_vm->sw.req_buf == NULL)
+		return -EINVAL;
 
 	dev_dbg(ACRN_DBG_HYCALL, "[%d] NOTIFY_FINISH for vcpu %d",
 			vmid, vcpu_id);
@@ -430,6 +450,14 @@ int64_t hcall_set_vm_memmap(struct vm *vm, uint64_t vmid, uint64_t param)
 	hpa = gpa2hpa(vm, memmap.vm0_gpa);
 	dev_dbg(ACRN_DBG_HYCALL, "[vm%d] gpa=0x%x hpa=0x%x size=0x%x",
 			vmid, memmap.remote_gpa, hpa, memmap.length);
+
+	if (((hpa <= CONFIG_RAM_START) &&
+		(hpa + memmap.length > CONFIG_RAM_START)) ||
+		((hpa >= CONFIG_RAM_START) &&
+		(hpa < CONFIG_RAM_START + CONFIG_RAM_SIZE))) {
+		pr_err("%s: ERROR! overlap the HV memory region.", __func__);
+		return -1;
+	}
 
 	/* Check prot */
 	attr = 0;
@@ -652,6 +680,62 @@ int64_t hcall_setup_sbuf(struct vm *vm, uint64_t param)
 	return sbuf_share_setup(ssp.pcpu_id, ssp.sbuf_id, hva);
 }
 
+int64_t hcall_get_cpu_pm_state(struct vm *vm, uint64_t cmd, uint64_t param)
+{
+	int target_vm_id;
+	struct vm *target_vm;
+
+	target_vm_id = (cmd & PMCMD_VMID_MASK) >> PMCMD_VMID_SHIFT;
+	target_vm = get_vm_from_vmid(target_vm_id);
+
+	if (!target_vm) {
+		return -1;
+	}
+
+	switch (cmd & PMCMD_TYPE_MASK) {
+	case PMCMD_GET_PX_CNT: {
+
+		if (!target_vm->pm.px_cnt) {
+			return -1;
+		}
+
+		if (copy_to_vm(vm, &(target_vm->pm.px_cnt), param)) {
+			pr_err("%s: Unable copy param to vm\n", __func__);
+			return -1;
+		}
+		return 0;
+	}
+	case PMCMD_GET_PX_DATA: {
+		int pn;
+		struct cpu_px_data *px_data;
+
+		/* For now we put px data as per-vm,
+		 * If it is stored as per-cpu in the future,
+		 * we need to check PMCMD_VCPUID_MASK in cmd.
+		 */
+		if (!target_vm->pm.px_cnt) {
+			return -1;
+		}
+
+		pn = (cmd & PMCMD_STATE_NUM_MASK) >> PMCMD_STATE_NUM_SHIFT;
+		if (pn >= target_vm->pm.px_cnt) {
+			return -1;
+		}
+
+		px_data = target_vm->pm.px_data + pn;
+		if (copy_to_vm(vm, px_data, param)) {
+			pr_err("%s: Unable copy param to vm\n", __func__);
+			return -1;
+		}
+
+		return 0;
+	}
+	default:
+		return -1;
+
+	}
+}
+
 static void fire_vhm_interrupt(void)
 {
 	/*
@@ -702,20 +786,22 @@ static void acrn_print_request(int vcpu_id, struct vhm_request *req)
 
 int acrn_insert_request_wait(struct vcpu *vcpu, struct vhm_request *req)
 {
-	struct vhm_request_buffer *req_buf =
-		(void *)HPA2HVA(vcpu->vm->sw.req_buf);
+	struct vhm_request_buffer *req_buf = NULL;
 	long cur;
 
 	ASSERT(sizeof(*req) == (4096/VHM_REQUEST_MAX),
 			"vhm_request page broken!");
 
 
-	if (!vcpu || !req || vcpu->vm->sw.req_buf == 0)
-		return -1;
+	if (!vcpu || !req || vcpu->vm->sw.req_buf == NULL)
+		return -EINVAL;
+
+	req_buf = (struct vhm_request_buffer *)(vcpu->vm->sw.req_buf);
 
 	/* ACRN insert request to VHM and inject upcall */
 	cur = vcpu->vcpu_id;
-	req_buf->req_queue[cur] = *req;
+	memcpy_s(&req_buf->req_queue[cur], sizeof(struct vhm_request),
+		 req, sizeof(struct vhm_request));
 
 	/* Must clear the signal before we mark req valid
 	 * Once we mark to valid, VHM may process req and signal us
@@ -742,9 +828,9 @@ int acrn_insert_request_nowait(struct vcpu *vcpu, struct vhm_request *req)
 	long cur;
 
 	if (!vcpu || !req || !vcpu->vm->sw.req_buf)
-		return -1;
+		return -EINVAL;
 
-	req_buf = (void *)gpa2hpa(vcpu->vm, vcpu->vm->sw.req_buf);
+	req_buf = (struct vhm_request_buffer *)(vcpu->vm->sw.req_buf);
 
 	/* ACRN insert request to VHM and inject upcall */
 	cur = vcpu->vcpu_id;

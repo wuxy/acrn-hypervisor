@@ -64,7 +64,7 @@
 #define REQUEST_WRITE	1
 
 /* Generic VM flags from guest OS */
-#define SECURE_WORLD_ENABLED    (1<<0)  /* Whether secure world is enabled */
+#define SECURE_WORLD_ENABLED    (1UL<<0)  /* Whether secure world is enabled */
 
 /**
  * @brief Hypercall
@@ -152,7 +152,7 @@ struct acrn_create_vm {
 	uint8_t	 GUID[16];
 
 	/* VM flag bits from Guest OS, now used
-	 *  SECURE_WORLD_ENABLED          (1<<0)
+	 *  SECURE_WORLD_ENABLED          (1UL<<0)
 	 */
 	uint64_t vm_flag;
 
@@ -287,6 +287,39 @@ struct acrn_vm_pci_msix_remap {
  * 0xd0000 usage.
  */
 #define GUEST_CFG_OFFSET	0xd0000
+
+/**
+ * @brief Info The power state data of a VCPU.
+ *
+ */
+struct cpu_px_data {
+	uint64_t core_frequency;	/* megahertz */
+	uint64_t power;			/* milliWatts */
+	uint64_t transition_latency;	/* microseconds */
+	uint64_t bus_master_latency;	/* microseconds */
+	uint64_t control;		/* control value */
+	uint64_t status;		/* success indicator */
+} __attribute__((aligned(8)));
+
+/**
+ * @brief Info PM command from DM/VHM.
+ *
+ * The command would specify request type(i.e. get px count or data) for
+ * specific VM and specific VCPU with specific state number.like P(n).
+ */
+#define PMCMD_VMID_MASK		0xff000000
+#define PMCMD_VCPUID_MASK	0x00ff0000
+#define PMCMD_STATE_NUM_MASK	0x0000ff00
+#define PMCMD_TYPE_MASK		0x000000ff
+
+#define PMCMD_VMID_SHIFT	24
+#define PMCMD_VCPUID_SHIFT	16
+#define PMCMD_STATE_NUM_SHIFT	8
+
+enum pm_cmd_type {
+	PMCMD_GET_PX_CNT,
+	PMCMD_GET_PX_DATA,
+};
 
 /**
  * @}
